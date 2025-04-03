@@ -13,11 +13,13 @@
 # limitations under the License.
 import os
 import time
+import platform
 from typing import Generator
 from tqdm import tqdm
 from hyperpyyaml import load_hyperpyyaml
 from modelscope import snapshot_download
 import torch
+from ais_bench.infer.interface import InferSession
 from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 from cosyvoice.cli.model import CosyVoiceModel, CosyVoice2Model
 from cosyvoice.utils.file_utils import logging
@@ -126,7 +128,7 @@ class CosyVoice:
 
 class CosyVoice2(CosyVoice):
 
-    def __init__(self, model_dir, load_jit=False, load_trt=False, fp16=False):
+    def __init__(self, model_dir, load_jit=False, load_trt=False, fp16=False, load_om=False):
         self.instruct = True if '-Instruct' in model_dir else False
         self.model_dir = model_dir
         self.fp16 = fp16
@@ -155,6 +157,16 @@ class CosyVoice2(CosyVoice):
             self.model.load_trt('{}/flow.decoder.estimator.{}.mygpu.plan'.format(model_dir, 'fp16' if self.fp16 is True else 'fp32'),
                                 '{}/flow.decoder.estimator.fp32.onnx'.format(model_dir),
                                 self.fp16)
+        if load_om:
+            arch = platform.machine()
+            system = platform.system().lower()
+            flow_om = InferSession(0, '{}/flow_{}_{}.om'.format(model_dir, system ,arch))
+            flow_om_static = InferSession(0, '{}/flow_static.om'.format(model_dir))
+            speech_om = InferSession(0, '{}/speech_{}_{}.om'.format(model_dir, system ,arch))
+            self.frontend.speech_om = speech_om
+            self.frontend.flow_om = flow_om
+            self.model.flow.decoder.flow_om_static = flow_om_static
+            self.model.flow.decoder.flow_om = flow_om
         del configs
 
     def inference_instruct(self, *args, **kwargs):

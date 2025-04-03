@@ -71,6 +71,8 @@ class CosyVoiceFrontEnd:
             self.zh_tn_model = ZhNormalizer(remove_erhua=False, full_to_half=False, overwrite_cache=True)
             self.en_tn_model = EnNormalizer()
             self.inflect_parser = inflect.engine()
+        self.speech_om = None
+        self.flow_om = None
 
     def _extract_text_token(self, text):
         if isinstance(text, Generator):
@@ -92,11 +94,16 @@ class CosyVoiceFrontEnd:
     def _extract_speech_token(self, speech):
         assert speech.shape[1] / 16000 <= 30, 'do not support extract speech token for audio longer than 30s'
         feat = whisper.log_mel_spectrogram(speech, n_mels=128)
-        speech_token = self.speech_tokenizer_session.run(None,
-                                                         {self.speech_tokenizer_session.get_inputs()[0].name:
-                                                          feat.detach().cpu().numpy(),
-                                                          self.speech_tokenizer_session.get_inputs()[1].name:
-                                                          np.array([feat.shape[2]], dtype=np.int32)})[0].flatten().tolist()
+        if torch.npu.is_available() and self.speech_om:
+            feed = [feat.detach().cpu().numpy(), np.array([feat.shape[2]], dtype=np.int32)]
+            speech_token = self.speech_om.infer(feed, mode='dymshape', custom_sizes=[100000000])[0].flatten().tolist()
+            self.flow_om.set_context() 
+        else:
+            speech_token = self.speech_tokenizer_session.run(None,
+                                                            {self.speech_tokenizer_session.get_inputs()[0].name:
+                                                            feat.detach().cpu().numpy(),
+                                                            self.speech_tokenizer_session.get_inputs()[1].name:
+                                                            np.array([feat.shape[2]], dtype=np.int32)})[0].flatten().tolist()
         speech_token = torch.tensor([speech_token], dtype=torch.int32).to(self.device)
         speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(self.device)
         return speech_token, speech_token_len

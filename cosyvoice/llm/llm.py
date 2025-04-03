@@ -229,16 +229,17 @@ class Qwen2Encoder(torch.nn.Module):
         super().__init__()
         self.model = Qwen2ForCausalLM.from_pretrained(pretrain_path)
 
-    def forward_one_step(self, xs, masks, cache=None):
-        input_masks = masks[:, -1, :]
-        outs = self.model(
-            inputs_embeds=xs,
-            attention_mask=input_masks,
-            output_hidden_states=True,
-            return_dict=True,
-            use_cache=True,
-            past_key_values=cache,
-        )
+    def forward_one_step(self, xs, masks, prompt_length, cache=None):
+        with torch.no_grad():
+            outs = self.model(
+                inputs_embeds=xs,
+                attention_mask=masks,
+                prompt_length=prompt_length,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=True,
+                past_key_values=cache,
+            )
         xs = outs.hidden_states[-1]
         new_cache = outs.past_key_values
         return xs, new_cache
@@ -318,9 +319,16 @@ class Qwen2LM(TransformerLM):
         # 5. step by step decode
         out_tokens = []
         cache = None
+        input_length = lm_input.shape[1]
         for i in range(max_len):
+            prompt_length = input_length + i
+            if i == 0:
+                masks = torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool).logical_not()
+            else:
+                masks = None
             y_pred, cache = self.llm.forward_one_step(lm_input,
-                                                      masks=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool),
+                                                      masks=masks,
+                                                      prompt_length=prompt_length,
                                                       cache=cache)
             logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
             top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False).item()
@@ -331,7 +339,7 @@ class Qwen2LM(TransformerLM):
             # in stream mode, yield token one by one
             yield top_ids
             out_tokens.append(top_ids)
-            lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
+            lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1).detach().clone() #torchair编译会设置权重内存地址冻结，这里的clone操作为了防止该内存地址的数据被重写
 
     @torch.inference_mode()
     def inference_bistream(

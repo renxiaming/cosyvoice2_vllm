@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch.nn import Conv1d
 from torch.nn import ConvTranspose1d
 from torch.nn.utils import remove_weight_norm
+from torch.nn.utils.parametrize import remove_parametrizations
 from torch.nn.utils.parametrizations import weight_norm
 from torch.distributions.uniform import Uniform
 
@@ -99,8 +100,8 @@ class ResBlock(torch.nn.Module):
 
     def remove_weight_norm(self):
         for idx in range(len(self.convs1)):
-            remove_weight_norm(self.convs1[idx])
-            remove_weight_norm(self.convs2[idx])
+            remove_parametrizations(self.convs1[idx], "weight")
+            remove_parametrizations(self.convs2[idx], "weight")
 
 
 class SineGen(torch.nn.Module):
@@ -319,14 +320,11 @@ class HiFTGenerator(nn.Module):
     def remove_weight_norm(self):
         print('Removing weight norm...')
         for l in self.ups:
-            remove_weight_norm(l)
+            remove_parametrizations(l, 'weight')
         for l in self.resblocks:
             l.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
-        self.m_source.remove_weight_norm()
-        for l in self.source_downs:
-            remove_weight_norm(l)
+        remove_parametrizations(self.conv_pre, 'weight')
+        remove_parametrizations(self.conv_post, 'weight')
         for l in self.source_resblocks:
             l.remove_weight_norm()
 
@@ -346,9 +344,7 @@ class HiFTGenerator(nn.Module):
                                         self.istft_params["n_fft"], window=self.stft_window.to(magnitude.device))
         return inverse_transform
 
-    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
-        s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
-        s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+    def decode(self, x: torch.Tensor, s_stft: torch.Tensor, index: torch.int) -> torch.Tensor:
 
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
@@ -356,7 +352,7 @@ class HiFTGenerator(nn.Module):
             x = self.ups[i](x)
 
             if i == self.num_upsamples - 1:
-                x = self.reflection_pad(x)
+                x = torch.cat((x[:,:,1:2], x), -1)
 
             # fusion
             si = self.source_downs[i](s_stft)
@@ -373,12 +369,10 @@ class HiFTGenerator(nn.Module):
 
         x = F.leaky_relu(x)
         x = self.conv_post(x)
-        magnitude = torch.exp(x[:, :self.istft_params["n_fft"] // 2 + 1, :])
-        phase = torch.sin(x[:, self.istft_params["n_fft"] // 2 + 1:, :])  # actually, sin is redundancy
+        magnitude = torch.exp(x[:, :index, :])
+        phase = torch.sin(x[:, index:, :])  # actually, sin is redundancy
 
-        x = self._istft(magnitude, phase)
-        x = torch.clamp(x, -self.audio_limit, self.audio_limit)
-        return x
+        return magnitude, phase
 
     def forward(
             self,
@@ -407,5 +401,11 @@ class HiFTGenerator(nn.Module):
         # use cache_source to avoid glitch
         if cache_source.shape[2] != 0:
             s[:, :, :cache_source.shape[2]] = cache_source
-        generated_speech = self.decode(x=speech_feat, s=s)
+        # torchair编译，对decode函数做部分适配
+        s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
+        s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+        index = self.istft_params["n_fft"] // 2 + 1 # 为了适配dynamo编译，把decode内部index拿到外部计算
+        magnitude, phase = self.decode(x=speech_feat, s_stft=s_stft, index=index)
+        x = self._istft(magnitude, phase)
+        generated_speech = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return generated_speech, s

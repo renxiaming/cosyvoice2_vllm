@@ -107,12 +107,33 @@ def init_weights(m, mean=0.0, std=0.01):
 
 # Repetition Aware Sampling in VALL-E 2
 def ras_sampling(weighted_scores, decoded_tokens, sampling, top_p=0.8, top_k=25, win_size=10, tau_r=0.1):
-    top_ids = nucleus_sampling(weighted_scores, top_p=top_p, top_k=top_k)
+    top_ids = dst_sampling(weighted_scores, top_p=top_p, top_k=top_k)
     rep_num = (torch.tensor(decoded_tokens[-win_size:]).to(weighted_scores.device) == top_ids).sum().item()
     if rep_num >= win_size * tau_r:
         top_ids = random_sampling(weighted_scores, decoded_tokens, sampling)
     return top_ids
 
+def dst_sampling(weighted_scores, top_p=0.8, top_k=25):
+
+    sorted_value, sorted_idx = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
+
+    cum_sum = torch.cumsum(sorted_value, dim=0)
+    n = sorted_value.size(0)
+    device = cum_sum.device
+    pre_cum_sum = torch.cat([torch.zeros(1, device=device), cum_sum[:-1]])
+
+    indices = torch.arange(n, device=device)
+    condition = (pre_cum_sum < top_p) & (indices < top_k)
+
+    max_i_tensor = torch.where(condition, indices, torch.tensor(-1, device=device))
+    n_selected = max_i_tensor.max() + 1
+
+    selected_prob = sorted_value[:n_selected]
+    selected_indices = sorted_idx[:n_selected]
+
+    top_ids = selected_indices[selected_prob.multinomial(1, replacement=True)]
+
+    return top_ids
 
 def nucleus_sampling(weighted_scores, top_p=0.8, top_k=25):
     prob, indices = [], []

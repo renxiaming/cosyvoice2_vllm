@@ -14,6 +14,7 @@
 import threading
 import torch
 import torch.nn.functional as F
+import numpy as np
 from matcha.models.components.flow_matching import BASECFM
 
 
@@ -32,6 +33,8 @@ class ConditionalCFM(BASECFM):
         # Just change the architecture of the estimator here
         self.estimator = estimator
         self.lock = threading.Lock()
+        self.flow_om = None
+        self.flow_om_static = None
 
     @torch.inference_mode()
     def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, prompt_len=0, flow_cache=torch.zeros(1, 80, 0, 2)):
@@ -105,12 +108,26 @@ class ConditionalCFM(BASECFM):
             t_in[:] = t.unsqueeze(0)
             spks_in[0] = spks
             cond_in[0] = cond
-            dphi_dt = self.forward_estimator(
-                x_in, mask_in,
-                mu_in, t_in,
-                spks_in,
-                cond_in
-            )
+            # 动态分档推理, 在流式输出中，每次输出的token数目固定，可以采取动态分档模型执行推理
+            if torch.npu.is_available() and self.flow_om_static and x.size(2)%100==0 and x.size(2)<800:
+                feed_list = [x_in, mask_in, mu_in, t_in, spks_in, cond_in]
+                feed = [i.cpu().detach().numpy().astype(np.float32) for i in feed_list]
+                dphi_dt = self.flow_om_static.infer(feed, mode="dymdims")
+                self.flow_om.set_context()
+                dphi_dt = torch.from_numpy(dphi_dt[0]).npu()
+            # 输出的token数目不固定场景采用动态模型推理
+            elif torch.npu.is_available() and self.flow_om:
+                feed_list = [x_in, mask_in, mu_in, t_in, spks_in, cond_in]
+                feed = [i.cpu().detach().numpy().astype(np.float32) for i in feed_list]
+                dphi_dt = self.flow_om.infer(feed, mode="dymshape", custom_sizes=10000000)
+                dphi_dt = torch.from_numpy(dphi_dt[0]).npu()
+            else:
+                dphi_dt = self.forward_estimator(
+                    x_in, mask_in,
+                    mu_in, t_in,
+                    spks_in,
+                    cond_in
+                )
             dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
             dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
             x = x + dt * dphi_dt
