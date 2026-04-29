@@ -108,43 +108,15 @@ class ConditionalCFM(BASECFM):
             t_in[:] = t.unsqueeze(0)
             spks_in[0] = spks
             cond_in[0] = cond
-            # --- 修改开始：增加 Padding 对齐档位 ---
-            curr_len = x.size(2)
-            # print(curr_len)
-            # 定义你在 ATC 转换时设置的所有档位
-            gears = [50, 100, 200, 300, 400, 500, 600, 700] # TODO:[40, 90, 140, 190, 240, 290, 340, 390, 440, 490, 540, 590, 640, 690]
-            # 找到第一个大于等于当前长度的档位
-            target_len = next((g for g in gears if g >= curr_len), None)
-
-            if torch.npu.is_available() and self.flow_om_static and target_len is not None:
-                # 1. 准备 feed 数据
+            # 动态分档推理, 在流式输出中，每次输出的token数目固定，可以采取动态分档模型执行推理
+            #if torch.npu.is_available() and self.flow_om_static and x.size(2)%100==0 and x.size(2)<800:
+            if torch.npu.is_available() and self.flow_om_static and (x.size(2) - 40)%100==0 and x.size(2)<900:
                 feed_list = [x_in, mask_in, mu_in, t_in, spks_in, cond_in]
-                
-                # 2. 如果当前长度不等于档位，进行手动补零对齐
-                if curr_len < target_len:
-                    pad_len = target_len - curr_len
-                    # 只有最后一位维度需要补零，(0, pad_len) 表示在最后一个维度右侧补 pad_len 个 0
-                    # 注意：Numpy 的 pad 和 Torch 的 F.pad 略有不同，这里建议直接处理 numpy 或 torch
-                    # 为了兼容性，我们直接对 feed 列表里的 numpy 数组做处理
-                    processed_feed = []
-                    for tensor in feed_list:
-                        arr = tensor.cpu().detach().numpy().astype(np.float32)
-                        if len(arr.shape) == 3: # 处理 x, mask, mu, cond
-                            arr = np.pad(arr, ((0,0), (0,0), (0, pad_len)), mode='constant')
-                        processed_feed.append(arr)
-                    feed = processed_feed
-                else:
-                    feed = [i.cpu().detach().numpy().astype(np.float32) for i in feed_list]
-
-                # 3. NPU 推理
+                feed = [i.cpu().detach().numpy().astype(np.float32) for i in feed_list]
                 dphi_dt = self.flow_om_static.infer(feed, mode="dymdims")
                 self.flow_om.set_context()
-                
-                # 4. 取回结果并截断多余的 Padding
                 dphi_dt = torch.from_numpy(dphi_dt[0]).npu()
-                if curr_len < target_len:
-                    dphi_dt = dphi_dt[:, :, :curr_len]
-            # --- 修改结束 ---
+            # 输出的token数目不固定场景采用动态模型推理
             elif torch.npu.is_available() and self.flow_om:
                 feed_list = [x_in, mask_in, mu_in, t_in, spks_in, cond_in]
                 feed = [i.cpu().detach().numpy().astype(np.float32) for i in feed_list]

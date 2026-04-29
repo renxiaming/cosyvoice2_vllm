@@ -50,3 +50,6 @@ pretrained_models/*
 *_pb2_grpc.py
 *_pb2.py
 *.tar
+
+
+./transformers/.git/objects/pack/pack-7b35e4459db13e60cbed834ae6909be7b8f269de.pack

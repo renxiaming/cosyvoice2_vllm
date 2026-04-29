@@ -128,7 +128,7 @@ class CosyVoice:
 
 class CosyVoice2(CosyVoice):
 
-    def __init__(self, model_dir, load_jit=False, load_trt=False, fp16=False, load_om=False):
+    def __init__(self, model_dir, load_jit=False, load_trt=False, fp16=False, load_om=False,load_vllm=False):
         self.instruct = True if '-Instruct' in model_dir else False
         self.model_dir = model_dir
         self.fp16 = fp16
@@ -144,8 +144,8 @@ class CosyVoice2(CosyVoice):
                                           '{}/spk2info.pt'.format(model_dir),
                                           configs['allowed_special'])
         self.sample_rate = configs['sample_rate']
-        if torch.cuda.is_available() is False and (load_jit is True or load_trt is True or fp16 is True):
-            load_jit, load_trt, fp16 = False, False, False
+        if torch.cuda.is_available() is False and (load_jit is True or load_trt is True or fp16 is True or load_vllm is True):
+            load_jit, load_trt, fp16 ,load_vllm= False, False, False,False
             logging.warning('no cuda device, set load_jit/load_trt/fp16 to False')
         self.model = CosyVoice2Model(configs['llm'], configs['flow'], configs['hift'], fp16)
         self.model.load('{}/llm.pt'.format(model_dir),
@@ -162,11 +162,19 @@ class CosyVoice2(CosyVoice):
             system = platform.system().lower()
             flow_om = InferSession(0, '{}/flow_{}_{}.om'.format(model_dir, system ,arch))
             flow_om_static = InferSession(0, '{}/flow_static.om'.format(model_dir))
+
+            
             speech_om = InferSession(0, '{}/speech_{}_{}.om'.format(model_dir, system ,arch))
+            # speech_om_path="/home/ma-user/work/test/model/weight/om/fp16_dynamic50"#xmren临时增加path
+            # speech_om = InferSession(0, '{}/speech_{}_{}.om'.format(speech_om_path, system ,arch))
+            
             self.frontend.speech_om = speech_om
             self.frontend.flow_om = flow_om
             self.model.flow.decoder.flow_om_static = flow_om_static
             self.model.flow.decoder.flow_om = flow_om
+            
+        if load_vllm:
+            self.model.load_vllm('{}/vllm'.format(model_dir))
         del configs
 
     def inference_instruct(self, *args, **kwargs):

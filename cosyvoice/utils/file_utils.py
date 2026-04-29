@@ -15,6 +15,7 @@
 
 import json
 import torchaudio
+import os
 import logging
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 logging.basicConfig(level=logging.DEBUG,
@@ -87,3 +88,32 @@ def convert_onnx_to_trt(trt_model, onnx_model, fp16):
     # save trt engine
     with open(trt_model, "wb") as f:
         f.write(engine_bytes)
+
+# NOTE do not support bistream inference as only speech token embedding/head is kept
+def export_cosyvoice2_vllm(model, model_path, device):
+    if os.path.exists(model_path):
+        return
+
+    dtype = torch.bfloat16
+    # lm_head
+    use_bias = True if model.llm_decoder.bias is not None else False
+    model.llm.model.lm_head = model.llm_decoder
+    # embed_tokens
+    embed_tokens = model.llm.model.model.embed_tokens
+    model.llm.model.set_input_embeddings(model.speech_embedding)
+    model.llm.model.to(device)
+    model.llm.model.to(dtype)
+    tmp_vocab_size = model.llm.model.config.vocab_size
+    tmp_tie_embedding = model.llm.model.config.tie_word_embeddings
+    del model.llm.model.generation_config.eos_token_id
+    del model.llm.model.config.bos_token_id
+    del model.llm.model.config.eos_token_id
+    model.llm.model.config.vocab_size = model.speech_embedding.num_embeddings
+    model.llm.model.config.tie_word_embeddings = False
+    model.llm.model.config.use_bias = use_bias
+    model.llm.model.save_pretrained(model_path)
+    if use_bias is True:
+        os.system('sed -i s@Qwen2ForCausalLM@CosyVoice2ForCausalLM@g {}/config.json'.format(os.path.abspath(model_path)))
+    model.llm.model.config.vocab_size = tmp_vocab_size
+    model.llm.model.config.tie_word_embeddings = tmp_tie_embedding
+    model.llm.model.set_input_embeddings(embed_tokens)

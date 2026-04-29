@@ -1,0 +1,11 @@
+<0428>
+xmren修改
+        if load_om:
+                    arch = platform.machine()
+                    system = platform.system().lower()
+                    flow_om = InferSession(0, '{}/flow_{}_{}.om'.format(model_dir, system ,arch))
+                    flow_om_static = InferSession(0, '{}/flow_static.om'.format(model_dir))
+
+                    speech_om_path="/home/ma-user/work/test/model/weight/om/fp16_dynamic50"#xmren临时增加path
+                    # speech_om = InferSession(0, '{}/speech_{}_{}.om'.format(model_dir, system ,arch))
+                    speech_om = InferSession(0, '{}/speech_{}_{}.om'.format(speech_om_path, system ,arch))

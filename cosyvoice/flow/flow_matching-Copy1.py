@@ -112,7 +112,7 @@ class ConditionalCFM(BASECFM):
             curr_len = x.size(2)
             # print(curr_len)
             # 定义你在 ATC 转换时设置的所有档位
-            gears = [50, 100, 200, 300, 400, 500, 600, 700] # TODO:[40, 90, 140, 190, 240, 290, 340, 390, 440, 490, 540, 590, 640, 690]
+            gears = [40, 90, 140, 190, 240, 290, 340, 390, 440, 490, 540, 590, 640, 690]
             # 找到第一个大于等于当前长度的档位
             target_len = next((g for g in gears if g >= curr_len), None)
 

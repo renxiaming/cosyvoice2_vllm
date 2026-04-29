@@ -232,7 +232,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10
+            #n_timesteps=10
+            n_timesteps=6
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
