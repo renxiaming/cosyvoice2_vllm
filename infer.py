@@ -17,6 +17,7 @@ import torchair as tng
 from torchair.configs.compiler_config import CompilerConfig
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import load_wav
+import os
 
 
 
@@ -54,5 +55,5 @@ if __name__ == '__main__':
         # print('warm up end')
         # import ipdb;ipdb.set_trace()
         # for _ in range(args.infer_count):
-            for i, j in enumerate(cosyvoice.inference_sft(prompt_txt, '中文女', stream=False)):
+            for i, j in enumerate(cosyvoice.inference_sft(prompt_txt, '中文女', stream=args.stream)):
                 torchaudio.save('testout/sft_{}.wav'.format(i), j['tts_speech'], cosyvoice.sample_rate)

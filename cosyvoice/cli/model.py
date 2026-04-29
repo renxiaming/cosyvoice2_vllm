@@ -24,6 +24,44 @@ from cosyvoice.utils.common import fade_in_out
 from cosyvoice.utils.file_utils import convert_onnx_to_trt
 
 
+def _get_accelerator_device() -> torch.device:
+    """Prefer NPU (Ascend) then CUDA, otherwise CPU."""
+    try:
+        import torch_npu  # noqa: F401
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return torch.device("npu")
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _empty_cache():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return
+    try:
+        import torch_npu  # noqa: F401
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.empty_cache()
+    except Exception:
+        pass
+
+
+def _make_stream_context(device: torch.device):
+    if torch.cuda.is_available():
+        return torch.cuda.stream(torch.cuda.Stream(device))
+    try:
+        import torch_npu  # noqa: F401
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            # torch-npu provides torch.npu.Stream / torch.npu.stream
+            return torch.npu.stream(torch.npu.Stream(device))
+    except Exception:
+        pass
+    return nullcontext()
+
+
 class CosyVoiceModel:
 
     def __init__(self,
@@ -31,7 +69,7 @@ class CosyVoiceModel:
                  flow: torch.nn.Module,
                  hift: torch.nn.Module,
                  fp16: bool):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = _get_accelerator_device()
         self.llm = llm
         self.flow = flow
         self.hift = hift
@@ -57,7 +95,7 @@ class CosyVoiceModel:
         # rtf and decoding related
         self.stream_scale_factor = 1
         assert self.stream_scale_factor >= 1, 'stream_scale_factor should be greater than 1, change it according to your actual rtf'
-        self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
+        self.llm_context = _make_stream_context(self.device)
         self.lock = threading.Lock()
         # dict used to store session related variable
         self.tts_speech_token_dict = {}
@@ -225,7 +263,7 @@ class CosyVoiceModel:
             self.mel_overlap_dict.pop(this_uuid)
             self.hift_cache_dict.pop(this_uuid)
             self.flow_cache_dict.pop(this_uuid)
-        torch.cuda.empty_cache()
+        _empty_cache()
 
     def vc(self, source_speech_token, flow_prompt_speech_token, prompt_speech_feat, flow_embedding, stream=False, speed=1.0, **kwargs):
         # this_uuid is used to track variables related to this inference thread
@@ -279,7 +317,7 @@ class CosyVoiceModel:
             self.llm_end_dict.pop(this_uuid)
             self.mel_overlap_dict.pop(this_uuid)
             self.hift_cache_dict.pop(this_uuid)
-        torch.cuda.empty_cache()
+        _empty_cache()
 
 
 class CosyVoice2Model(CosyVoiceModel):
@@ -289,7 +327,7 @@ class CosyVoice2Model(CosyVoiceModel):
                  flow: torch.nn.Module,
                  hift: torch.nn.Module,
                  fp16: bool):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = _get_accelerator_device()
         self.llm = llm
         self.flow = flow
         self.hift = hift
@@ -310,7 +348,7 @@ class CosyVoice2Model(CosyVoiceModel):
         self.speech_window = np.hamming(2 * self.source_cache_len)
         # rtf and decoding related
         self.stream_scale_factor = 1
-        self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
+        self.llm_context = _make_stream_context(self.device)
         self.lock = threading.Lock()
         # dict used to store session related variable
         self.tts_speech_token_dict = {}
@@ -325,10 +363,17 @@ class CosyVoice2Model(CosyVoiceModel):
     def load_vllm(self, model_dir):
         export_cosyvoice2_vllm(self.llm, model_dir, self.device)
         from vllm import EngineArgs, LLMEngine
-        engine_args = EngineArgs(model=model_dir,
-                                 skip_tokenizer_init=True,
-                                 enable_prompt_embeds=True,
-                                 gpu_memory_utilization=0.2)
+        # vLLM backend differs across platforms. Prefer NPU when available.
+        base_kwargs = dict(
+            model=model_dir,
+            skip_tokenizer_init=True,
+            enable_prompt_embeds=True,
+            gpu_memory_utilization=0.2,
+        )
+        try:
+            engine_args = EngineArgs(**base_kwargs, device="npu")
+        except TypeError:
+            engine_args = EngineArgs(**base_kwargs)
         self.llm.vllm = LLMEngine.from_engine_args(engine_args)
         self.llm.lock = threading.Lock()
         del self.llm.llm.model.model.layers
@@ -492,4 +537,4 @@ class CosyVoice2Model(CosyVoiceModel):
         with self.lock:
             self.tts_speech_token_dict.pop(this_uuid)
             self.llm_end_dict.pop(this_uuid)
-        torch.cuda.empty_cache()
+        _empty_cache()

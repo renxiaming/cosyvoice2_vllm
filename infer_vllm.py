@@ -59,5 +59,17 @@ if __name__ == '__main__':
         print('warm up end')
         # import ipdb;ipdb.set_trace()
         for _ in range(args.infer_count):
-            for i, j in enumerate(cosyvoice.inference_sft(prompt_txt, '中文女', stream=args.stream)):
-                torchaudio.save('sft_{}.wav'.format(i), j['tts_speech'], cosyvoice.sample_rate)
+            os.makedirs("testout", exist_ok=True)
+            if args.stream:
+                chunks = []
+                for j in cosyvoice.inference_sft(prompt_txt, '中文女', stream=args.stream):
+                    tts = j.get('tts_speech')
+                    if tts is not None:
+                        chunks.append(tts.detach().cpu())
+                if not chunks:
+                    raise RuntimeError("No audio chunks returned from streaming inference.")
+                full = torch.cat(chunks, dim=-1)
+                torchaudio.save('testout/sft_vllm.wav', full, cosyvoice.sample_rate)
+            else:
+                j = next(cosyvoice.inference_sft(prompt_txt, '中文女', stream=args.stream))
+                torchaudio.save('testout/sft_vllm.wav', j['tts_speech'].detach().cpu(), cosyvoice.sample_rate)

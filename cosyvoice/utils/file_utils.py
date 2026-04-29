@@ -17,6 +17,7 @@ import json
 import torchaudio
 import os
 import logging
+import torch
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(levelname)s %(message)s')

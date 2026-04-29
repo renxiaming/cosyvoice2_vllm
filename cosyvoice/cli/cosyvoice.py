@@ -26,6 +26,17 @@ from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.class_utils import get_model_type
 
 
+def _has_accelerator() -> bool:
+    """Return True if CUDA or Ascend NPU is available."""
+    if torch.cuda.is_available():
+        return True
+    try:
+        import torch_npu  # noqa: F401
+        return hasattr(torch, "npu") and torch.npu.is_available()
+    except Exception:
+        return False
+
+
 class CosyVoice:
 
     def __init__(self, model_dir, load_jit=False, load_trt=False, fp16=False):
@@ -144,9 +155,9 @@ class CosyVoice2(CosyVoice):
                                           '{}/spk2info.pt'.format(model_dir),
                                           configs['allowed_special'])
         self.sample_rate = configs['sample_rate']
-        if torch.cuda.is_available() is False and (load_jit is True or load_trt is True or fp16 is True or load_vllm is True):
+        if _has_accelerator() is False and (load_jit is True or load_trt is True or fp16 is True or load_vllm is True):
             load_jit, load_trt, fp16 ,load_vllm= False, False, False,False
-            logging.warning('no cuda device, set load_jit/load_trt/fp16 to False')
+            logging.warning('no accelerator device, set load_jit/load_trt/fp16/load_vllm to False')
         self.model = CosyVoice2Model(configs['llm'], configs['flow'], configs['hift'], fp16)
         self.model.load('{}/llm.pt'.format(model_dir),
                         '{}/flow.pt'.format(model_dir),
