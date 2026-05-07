@@ -29,8 +29,35 @@ from typing import Optional
 from packaging.version import parse as vparse
 import vllm
 
+# Some Ascend / editable installs may not re-export common symbols at
+# the top-level `vllm` module (or may load a namespace package first),
+# but vLLM internals still do `from vllm import SamplingParams`.
+# Patch it in from the canonical module location when missing.
+if not hasattr(vllm, "SamplingParams"):
+    try:
+        from vllm.sampling_params import SamplingParams as _SamplingParams  # type: ignore
+        setattr(vllm, "SamplingParams", _SamplingParams)
+    except Exception:
+        # If this also fails, the environment's vLLM install is broken.
+        # Let the later import error surface with its original context.
+        pass
+
+def _get_vllm_version() -> str:
+    # Some Ascend installations use `VLLM_TARGET_DEVICE=empty` with editable
+    # installs, where `vllm` may not expose `__version__` at import time.
+    v = getattr(vllm, "__version__", None)
+    if isinstance(v, str) and v:
+        return v
+    try:
+        from importlib.metadata import version as pkg_version  # py3.10+
+        return pkg_version("vllm")
+    except Exception:
+        # Conservative fallback: treat as new enough for V1-only behavior.
+        return "0.11.0"
+
+
 # vLLM-0.11.0+ only support V1 engine
-VLLM_V1_ENGINE_ONLY: bool = vparse(vllm.__version__) >= vparse("0.11.0")
+VLLM_V1_ENGINE_ONLY: bool = vparse(_get_vllm_version()) >= vparse("0.11.0")
 if VLLM_V1_ENGINE_ONLY:
     from vllm.v1.sample.metadata import SamplingMetadata
 

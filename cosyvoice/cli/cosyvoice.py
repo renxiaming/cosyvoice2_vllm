@@ -17,7 +17,7 @@ import platform
 from typing import Generator
 from tqdm import tqdm
 from hyperpyyaml import load_hyperpyyaml
-from modelscope import snapshot_download
+# from modelscope import snapshot_download
 import torch
 from ais_bench.infer.interface import InferSession
 from cosyvoice.cli.frontend import CosyVoiceFrontEnd
@@ -183,7 +183,7 @@ class CosyVoice2(CosyVoice):
             self.frontend.flow_om = flow_om
             self.model.flow.decoder.flow_om_static = flow_om_static
             self.model.flow.decoder.flow_om = flow_om
-            
+
         if load_vllm:
             self.model.load_vllm('{}/vllm'.format(model_dir))
         del configs

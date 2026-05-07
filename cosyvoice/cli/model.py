@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import os
 from typing import Generator
 import torch
@@ -20,8 +21,85 @@ import time
 from torch.nn import functional as F
 from contextlib import nullcontext
 import uuid
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from packaging.version import parse as _vparse
+
 from cosyvoice.utils.common import fade_in_out
-from cosyvoice.utils.file_utils import convert_onnx_to_trt
+from cosyvoice.utils.file_utils import convert_onnx_to_trt, export_cosyvoice2_vllm
+
+
+def _require_tokenizers_for_vllm_011() -> None:
+    """vLLM 0.11 arg_utils 依赖 tokenizers.decoders.DecodeStream（需 tokenizers>=0.22）。"""
+    try:
+        if _vparse(_pkg_version("tokenizers")) < _vparse("0.22.0"):
+            raise ImportError(
+                'tokenizers>=0.22.0 required (DecodeStream). Run: pip install -U '
+                '"tokenizers>=0.22.0" "transformers>=4.55.2" '
+                "or: pip install -r requirements-vllm-npu.txt"
+            )
+    except PackageNotFoundError:
+        pass
+
+
+def _import_vllm_engine_classes():
+    """Import EngineArgs / LLMEngine for vLLM 0.11.x and vllm-ascend.
+
+    `from vllm import EngineArgs` fails with namespace / partial installs
+    (ImportError: ... '(unknown location)'). Submodules resolve reliably.
+    """
+    _require_tokenizers_for_vllm_011()
+    import vllm  # noqa: F401 — ensure top-level package is loaded
+
+    from cosyvoice.utils.vllm_runtime import ensure_vllm_package_has_version
+
+    ensure_vllm_package_has_version()
+
+    errors: list[str] = []
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+        from vllm.engine.llm_engine import LLMEngine
+
+        ensure_vllm_package_has_version()
+        return EngineArgs, LLMEngine
+    except ImportError as e:
+        errors.append(f"vllm.engine.arg_utils / vllm.engine.llm_engine: {e}")
+    try:
+        from vllm import EngineArgs, LLMEngine  # type: ignore
+
+        ensure_vllm_package_has_version()
+        return EngineArgs, LLMEngine
+    except ImportError as e:
+        errors.append(f"vllm top-level: {e}")
+    joined = "\n- ".join(errors)
+    hint = ""
+    if "DecodeStream" in joined:
+        hint = (
+            "\n\n(DecodeStream → upgrade tokenizers + transformers: "
+            'pip install -U "tokenizers>=0.22.0" "transformers>=4.55.2" '
+            "or pip install -r requirements-vllm-npu.txt)\n"
+        )
+    raise ImportError(
+        "Cannot import vLLM EngineArgs / LLMEngine. On Ascend 910B use "
+        "vllm-ascend matching your vLLM version (e.g. vllm-ascend==0.11.0). "
+        "Tried:\n- " + joined + hint
+    ) from None
+
+
+def _ensure_vllm_top_level_model_registry() -> None:
+    """vllm_ascend does ``from vllm import ModelRegistry`` during EngineArgs init.
+
+    A repo-local ``vllm/`` tree or lazy namespace ``vllm`` may not expose it; patch
+    the resolved package so plugin import succeeds.
+    """
+    import vllm as _vp
+
+    if getattr(_vp, "ModelRegistry", None) is not None:
+        return
+    try:
+        from vllm.model_executor.models import ModelRegistry as _MR
+    except ImportError:
+        from vllm.model_executor.models.registry import ModelRegistry as _MR  # type: ignore
+    setattr(_vp, "ModelRegistry", _MR)
 
 
 def _get_accelerator_device() -> torch.device:
@@ -361,19 +439,27 @@ class CosyVoice2Model(CosyVoiceModel):
         self.flow.encoder = flow_encoder
 
     def load_vllm(self, model_dir):
+        from cosyvoice.utils.vllm_runtime import ensure_vllm_package_has_version
+
         export_cosyvoice2_vllm(self.llm, model_dir, self.device)
-        from vllm import EngineArgs, LLMEngine
-        # vLLM backend differs across platforms. Prefer NPU when available.
+        EngineArgs, LLMEngine = _import_vllm_engine_classes()
+        _ensure_vllm_top_level_model_registry()
+        # vLLM / vllm-ascend layouts differ: only pass device= when EngineArgs accepts it.
         base_kwargs = dict(
             model=model_dir,
             skip_tokenizer_init=True,
             enable_prompt_embeds=True,
             gpu_memory_utilization=0.2,
         )
-        try:
+        _ea_init = getattr(EngineArgs, "__init__", None)
+        _params = (
+            inspect.signature(_ea_init).parameters if _ea_init is not None else {}
+        )
+        if "device" in _params:
             engine_args = EngineArgs(**base_kwargs, device="npu")
-        except TypeError:
+        else:
             engine_args = EngineArgs(**base_kwargs)
+        ensure_vllm_package_has_version()
         self.llm.vllm = LLMEngine.from_engine_args(engine_args)
         self.llm.lock = threading.Lock()
         del self.llm.llm.model.model.layers

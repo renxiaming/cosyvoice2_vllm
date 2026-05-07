@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Dict, Optional, Callable, List, Generator
+import queue
+import time
+import uuid
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -284,6 +287,10 @@ class Qwen2LM(TransformerLM):
         self.sampling = sampling
         self.mix_ratio = mix_ratio
 
+        # 5. vLLM (CosyVoice2 + Ascend): eos and speech head specials
+        self.stop_token_ids = [self.speech_token_size + i for i in range(3)]
+        self.vllm_output_queue: dict = {}
+
     @torch.inference_mode()
     def inference(
             self,
@@ -316,7 +323,19 @@ class Qwen2LM(TransformerLM):
         min_len = int((text_len - prompt_text_len) * min_token_text_ratio)
         max_len = int((text_len - prompt_text_len) * max_token_text_ratio)
 
-        # 5. step by step decode
+        yield from self._inference_decode_tokens(lm_input, sampling, min_len, max_len)
+
+    def _inference_decode_tokens(
+            self,
+            lm_input: torch.Tensor,
+            sampling: int,
+            min_len: int,
+            max_len: int,
+    ) -> Generator[int, None, None]:
+        """HF Qwen2 one-token path, or vLLM prompt_embeds path when `self.vllm` is set."""
+        if hasattr(self, "vllm"):
+            yield from self._inference_decode_tokens_vllm(lm_input, sampling, min_len, max_len)
+            return
         out_tokens = []
         cache = None
         input_length = lm_input.shape[1]
@@ -336,10 +355,63 @@ class Qwen2LM(TransformerLM):
                 break
             if top_ids > self.speech_token_size:
                 continue
-            # in stream mode, yield token one by one
             yield top_ids
             out_tokens.append(top_ids)
-            lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1).detach().clone() #torchair编译会设置权重内存地址冻结，这里的clone操作为了防止该内存地址的数据被重写
+            lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1).detach().clone()  # torchair 冻结权重地址，clone 防写
+
+    def _inference_decode_tokens_vllm(
+            self,
+            lm_input: torch.Tensor,
+            sampling: int,
+            min_len: int,
+            max_len: int,
+    ) -> Generator[int, None, None]:
+        try:
+            from vllm.sampling_params import SamplingParams
+        except ImportError:
+            from vllm import SamplingParams  # type: ignore
+        try:
+            from vllm.outputs import RequestOutput
+        except ImportError:
+            from vllm import RequestOutput  # type: ignore
+
+        max_tokens = max(1, int(max_len))
+        min_tokens = max(0, min(int(min_len), max_tokens))
+        sampling_params = SamplingParams(
+            top_k=sampling,
+            stop_token_ids=self.stop_token_ids,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+        )
+        req_id = str(uuid.uuid4())
+        embeds = lm_input.squeeze(0).to(torch.bfloat16).to(lm_input.device)
+        prompt: dict = {"prompt_embeds": embeds}
+        with self.lock:
+            self.vllm.add_request(req_id, prompt, sampling_params)
+            self.vllm_output_queue[req_id] = queue.Queue()
+        out_tokens = []
+        try:
+            while True:
+                with self.lock:
+                    if self.vllm_output_queue[req_id].empty():
+                        request_outputs: List[RequestOutput] = self.vllm.step()
+                        for request_output in request_outputs:
+                            top_ids = list(request_output.outputs[0].token_ids)[-1]
+                            self.vllm_output_queue[request_output.request_id].put(top_ids)
+                if not self.vllm_output_queue[req_id].empty():
+                    top_ids = self.vllm_output_queue[req_id].get()
+                    if isinstance(top_ids, torch.Tensor):
+                        top_ids = int(top_ids.item())
+                    if top_ids in self.stop_token_ids:
+                        break
+                    yield top_ids
+                    out_tokens.append(top_ids)
+                    if len(out_tokens) >= max_tokens:
+                        break
+                time.sleep(0.001)
+        finally:
+            with self.lock:
+                self.vllm_output_queue.pop(req_id, None)
 
     @torch.inference_mode()
     def inference_bistream(
@@ -354,6 +426,11 @@ class Qwen2LM(TransformerLM):
             max_token_text_ratio: float = 20,
             min_token_text_ratio: float = 2,
     ) -> Generator[torch.Tensor, None, None]:
+        if hasattr(self, "vllm"):
+            raise NotImplementedError(
+                "CosyVoice2 vLLM path does not support bistream inference; "
+                "disable load_vllm or use non-bistream APIs."
+            )
 
         device = prompt_text.device
         # 1. prepare input
