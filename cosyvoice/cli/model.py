@@ -445,11 +445,17 @@ class CosyVoice2Model(CosyVoiceModel):
         EngineArgs, LLMEngine = _import_vllm_engine_classes()
         _ensure_vllm_top_level_model_registry()
         # vLLM / vllm-ascend layouts differ: only pass device= when EngineArgs accepts it.
+        _max_ml = int(os.environ.get("COSYVOICE_VLLM_MAX_MODEL_LEN", "16384"))
+        _gpu_util = float(os.environ.get("COSYVOICE_VLLM_GPU_MEMORY_UTILIZATION", "0.3"))
         base_kwargs = dict(
             model=model_dir,
             skip_tokenizer_init=True,
             enable_prompt_embeds=True,
-            gpu_memory_utilization=0.2,
+            # Exported Qwen2 config often keeps max_position_embeddings=32768; vLLM
+            # sizes KV for that and can exceed the budget when gpu_memory_utilization
+            # is low (esp. NPU shared with CosyVoice OM/flow). TTS does not need 32k.
+            max_model_len=_max_ml,
+            gpu_memory_utilization=_gpu_util,
         )
         _ea_init = getattr(EngineArgs, "__init__", None)
         _params = (

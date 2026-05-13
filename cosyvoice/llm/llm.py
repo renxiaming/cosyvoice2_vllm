@@ -322,7 +322,7 @@ class Qwen2LM(TransformerLM):
         # 4. cal min/max_length
         min_len = int((text_len - prompt_text_len) * min_token_text_ratio)
         max_len = int((text_len - prompt_text_len) * max_token_text_ratio)
-
+        # import pdb;pdb.set_trace
         yield from self._inference_decode_tokens(lm_input, sampling, min_len, max_len)
 
     def _inference_decode_tokens(
@@ -385,15 +385,17 @@ class Qwen2LM(TransformerLM):
         )
         req_id = str(uuid.uuid4())
         embeds = lm_input.squeeze(0).to(torch.bfloat16).to(lm_input.device)
-        prompt: dict = {"prompt_embeds": embeds}
+        prompt: dict = {"prompt_embeds": embeds, "prompt_token":lm_input}
+        import pdb;pdb.set_trace
         with self.lock:
-            self.vllm.add_request(req_id, prompt, sampling_params)
+            self.vllm.add_request(req_id, prompt, sampling_params)#报错发生处
             self.vllm_output_queue[req_id] = queue.Queue()
         out_tokens = []
         try:
             while True:
                 with self.lock:
                     if self.vllm_output_queue[req_id].empty():
+                        # import pdb;pdb.set_trace()
                         request_outputs: List[RequestOutput] = self.vllm.step()
                         for request_output in request_outputs:
                             top_ids = list(request_output.outputs[0].token_ids)[-1]

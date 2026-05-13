@@ -12,9 +12,13 @@ import multiprocessing
 import os
 import sys
 
-# Ascend/torch_npu: NPU must not be re-initialized in a forked child. vLLM V1
-# EngineCore uses multiprocessing; Linux defaults to "fork". Force "spawn"
-# before importing torch_npu or starting CosyVoice (ACL / device init).
+# vLLM 0.11: EngineCore uses ``vllm.utils.get_mp_context()`` →
+# ``VLLM_WORKER_MULTIPROC_METHOD`` (default fork). vLLM only auto-forces
+# spawn when CUDA/XPU is inited, not torch_npu — set spawn before any vLLM
+# engine starts (load_vllm also calls ensure_vllm_worker_multiproc_spawn_for_ascend).
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+# Belt-and-suspenders for any code using the default Process context.
 if __name__ == "__main__":
     try:
         multiprocessing.set_start_method("spawn", force=True)
