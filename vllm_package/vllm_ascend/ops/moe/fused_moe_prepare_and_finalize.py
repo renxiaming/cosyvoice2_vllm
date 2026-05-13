@@ -26,7 +26,7 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.utils import enable_sp
 
 
 class FusedMoEPrepareAndFinalize(ABC):
@@ -45,27 +45,24 @@ class FusedMoEPrepareAndFinalize(ABC):
         self.moe_config = moe_config
 
     @abstractmethod
-    def prepare(self,
-                hidden_states: torch.Tensor,
-                router_logits: torch.Tensor,
-                enable_shared_expert_dp: bool = False,
-                rm_router_logits: bool = False,
-                replace_allreduce: bool = False,
-                gate=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Prepare tensors before MoE computation. May involve:
           - Padding to align communication boundaries
           - Slicing across tensor-parallel ranks
           - Broadcasting across data-parallel ranks
-          - Recomputing router logits if needed
 
         Args:
             hidden_states (torch.Tensor): Input features, shape [num_tokens, hidden_size]
             router_logits (torch.Tensor): Router outputs, shape [num_tokens, num_experts]
             enable_shared_expert_dp (bool): Skip DP communication for shared experts
-            rm_router_logits (bool): Discard input router_logits and recompute via gate
             replace_allreduce (bool): Bypass default all-reduce behavior
-            gate (nn.Module, optional): Gate network to recompute router_logits if needed
 
         Returns:
             Tuple of:
@@ -114,13 +111,13 @@ class FusedMoEPrepareAndFinalizeWithMC2(FusedMoEPrepareAndFinalize):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
-    def prepare(self,
-                hidden_states: torch.Tensor,
-                router_logits: torch.Tensor,
-                enable_shared_expert_dp: bool = False,
-                rm_router_logits: bool = False,
-                replace_allreduce: bool = False,
-                gate=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Preparation steps:
           1. Fetch `mc2_mask` and target padding length from forward context.
@@ -213,13 +210,13 @@ class FusedMoEPrepareAndFinalizeWithAll2All(FusedMoEPrepareAndFinalize):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
-    def prepare(self,
-                hidden_states: torch.Tensor,
-                router_logits: torch.Tensor,
-                enable_shared_expert_dp: bool = False,
-                rm_router_logits: bool = False,
-                replace_allreduce: bool = False,
-                gate=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Preparation steps:
           1. Pad hidden_states and router_logits to next multiple of TP size.
@@ -287,30 +284,76 @@ class FusedMoEPrepareAndFinalizeWithAll2All(FusedMoEPrepareAndFinalize):
 
 class FusedMoEPrepareAndFinalizeWithAllGather(FusedMoEPrepareAndFinalize):
     """
-    MoE communication strategy using All-Gather + Reduce-Scatter.
-    Designed for DP > 1: gather inputs across DP ranks before MoE, scatter outputs after.
-    Uses `max_tokens_across_dp` from forward_context for padding alignment.
+    MoE communication strategy using All-Gather + Reduce-Scatter on EP group.
+    There are two sets of prepare and finalize:
+    1. _prepare_with_dp_group/_finalize_with_dp_group: When sequence parallelism is not enabled,
+    we gather inputs across DP ranks before MoE, scatter outputs after.
+    The communication and calculation process is as follows (AG, AR and RS
+    are abbreviations for All-Gather, All-Reduce and Reduce-Scatter, respectively):
+
+    Attn → TP AR → DP AG → MoE → DP RS → TP AR
+
+    2. _prepare_with_ep_group/_finalize_with_ep_group: When sequence parallelism is enabled,
+    the above process becomes:
+
+    TP AG → Attn → TP RS → TP AG → DP AG → MoE → DP RS → TP RS
+
+    This strategy further combines TP AG + DP AG into EP All-Gather and TP RS + DP RS
+    into EP Reduce-Scatter to improve communication performance. The optimized process is as follows:
+
+    TP AG → Attn → TP RS → EP AG → MoE → EP RS
     """
 
-    def prepare(self,
-                hidden_states: torch.Tensor,
-                router_logits: torch.Tensor,
-                enable_shared_expert_dp: bool = False,
-                rm_router_logits: bool = False,
-                replace_allreduce: bool = False,
-                gate=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Preparation steps:
+          AllGather hidden_states and router_logits to form global tensors.
+
+        Returns:
+            Tuple of (global_hidden_states, global_router_logits, None)
+        """
+        if enable_sp():
+            return self._prepare_with_ep_group(hidden_states, router_logits)
+
+        return self._prepare_with_dp_group(hidden_states, router_logits,
+                                           enable_shared_expert_dp,
+                                           replace_allreduce)
+
+    def _prepare_with_ep_group(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+            hidden_states, True, True)
+        router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+            router_logits, True, True)
+
+        return hidden_states, router_logits, None
+
+    def _prepare_with_dp_group(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Preparation steps:
           1. Fetch max token count across DP group from forward context.
           2. Pad local tensors to that size.
           3. All-gather across DP group to form global input tensor.
-          4. Optionally recompute router_logits using gate if `rm_router_logits=True`.
 
         Returns:
             Tuple of (global_hidden_states, global_router_logits, None)
         """
         self.enable_shared_expert_dp = enable_shared_expert_dp
-
         if self.moe_config.dp_size > 1:
             forward_context = get_forward_context()
             max_tokens_across_dp = forward_context.max_tokens_across_dp
@@ -320,23 +363,49 @@ class FusedMoEPrepareAndFinalizeWithAllGather(FusedMoEPrepareAndFinalize):
             if pad_size > 0:
                 hidden_states = nn.functional.pad(hidden_states,
                                                   (0, 0, 0, pad_size))
-                if not rm_router_logits:
-                    router_logits = nn.functional.pad(router_logits,
-                                                      (0, 0, 0, pad_size))
+                router_logits = nn.functional.pad(router_logits,
+                                                  (0, 0, 0, pad_size))
 
             # All-gather across DP group
             hidden_states = self.moe_config.dp_group.all_gather(
                 hidden_states, 0)
-            if rm_router_logits:
-                router_logits, _ = gate(hidden_states)  # Recompute globally
-            else:
-                router_logits = self.moe_config.dp_group.all_gather(
-                    router_logits, 0)
+            router_logits = self.moe_config.dp_group.all_gather(
+                router_logits, 0)
 
         return hidden_states, router_logits, None
 
     def finalize(self, hidden_states: torch.Tensor,
                  reduce_results: bool) -> torch.Tensor:
+        """
+        Finalization steps:
+          Reduce Scatter hidden states.
+
+        Returns:
+            Tensor with shape [local_num_tokens, hidden_size]
+        """
+        if enable_sp():
+            return self._finalize_with_ep_group(hidden_states)
+
+        return self._finalize_with_dp_group(hidden_states, reduce_results)
+
+    def _finalize_with_ep_group(self,
+                                hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Argument `reduce_results` is not needed in this func. Given sequence parallelism is enabled:
+        1. Reduce_results is False usually happens when models have shared experts and need to
+        allreduce hidden states after results of shared experts and routed experts are added in FusedMoe.
+        We do reduce scatter for hidden states here, then skip allreudce in FusedMoe and add it to the
+        result of shared experts.
+        2 Reduce_results is True usually happens when model has no shared experts. We still do reduce scatter
+        here, then skip allreudce in FusedMoe.
+        """
+        hidden_states = torch.ops.vllm.maybe_pad_and_reduce(
+            hidden_states, True)
+
+        return hidden_states
+
+    def _finalize_with_dp_group(self, hidden_states: torch.Tensor,
+                                reduce_results: bool) -> torch.Tensor:
         """
         Finalization steps:
           1. If DP > 1 and not shared expert, reduce-scatter output across DP group.
@@ -397,18 +466,17 @@ class FusedMoEPrepareAndFinalizeWithNaiveMulticast(FusedMoEPrepareAndFinalize):
             get_dp_group().broadcast(buffer[start:end, :], idx)
         return buffer
 
-    def prepare(self,
-                hidden_states: torch.Tensor,
-                router_logits: torch.Tensor,
-                enable_shared_expert_dp: bool = False,
-                rm_router_logits: bool = False,
-                replace_allreduce: bool = False,
-                gate=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Preparation steps:
           1. Fetch cumulative token boundaries from forward context.
           2. Multicast hidden_states and router_logits to form global tensors.
-          3. Optionally recompute router_logits globally if `rm_router_logits=True`.
 
         Returns:
             Tuple of (global_hidden_states, global_router_logits, None)
@@ -416,19 +484,12 @@ class FusedMoEPrepareAndFinalizeWithNaiveMulticast(FusedMoEPrepareAndFinalize):
         self.enable_shared_expert_dp = enable_shared_expert_dp
 
         if self.moe_config.dp_size > 1:
-            if vllm_version_is("0.10.2"):
-                self.cu_tokens_across_dp_cpu = get_forward_context(
-                ).dp_metadata.cu_tokens_across_dp_cpu
-            else:
-                self.cu_tokens_across_dp_cpu = get_forward_context(
-                ).dp_metadata.cu_tokens_across_sp(1)
+            self.cu_tokens_across_dp_cpu = get_forward_context(
+            ).dp_metadata.cu_tokens_across_sp(1)
             hidden_states = self._naive_multicast(hidden_states,
                                                   self.cu_tokens_across_dp_cpu)
-            if rm_router_logits:
-                router_logits, _ = gate(hidden_states)
-            else:
-                router_logits = self._naive_multicast(
-                    router_logits, self.cu_tokens_across_dp_cpu)
+            router_logits = self._naive_multicast(router_logits,
+                                                  self.cu_tokens_across_dp_cpu)
 
         return hidden_states, router_logits, None
 

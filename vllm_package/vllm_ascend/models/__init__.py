@@ -23,6 +23,10 @@ def register_model():
             "Qwen2_5_VLForConditionalGeneration",
             "vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration"
         )
+        ModelRegistry.register_model(
+            "Qwen2_5OmniModel",
+            "vllm_ascend.models.qwen2_5_omni_thinker:AscendQwen2_5OmniThinkerForConditionalGeneration"
+        )
     else:
         ModelRegistry.register_model(
             "Qwen2_5_VLForConditionalGeneration",
@@ -30,24 +34,8 @@ def register_model():
         )
 
     ModelRegistry.register_model(
-        "DeepseekV2ForCausalLM",
-        "vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM")
-
-    ModelRegistry.register_model(
-        "DeepseekV3ForCausalLM",
-        "vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM")
-
-    ModelRegistry.register_model(
         "DeepseekV32ForCausalLM",
-        "vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM")
-
-    ModelRegistry.register_model(
-        "DeepSeekMTPModel",
-        "vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP")
-
-    ModelRegistry.register_model(
-        "Qwen3MoeForCausalLM",
-        "vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM")
+        "vllm_ascend.models.deepseek_v3_2:CustomDeepseekV3ForCausalLM")
 
     # There is no PanguProMoEForCausalLM in vLLM, so we should register it before vLLM config initialization
     # to make sure the model can be loaded correctly. This register step can be removed once vLLM support PanguProMoEForCausalLM.

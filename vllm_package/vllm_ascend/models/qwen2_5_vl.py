@@ -34,6 +34,7 @@ from vllm.model_executor.layers.activation import get_act_and_mul_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VisionAttention, Qwen2_5_VisionBlock, Qwen2_5_VisionPatchEmbed,
     Qwen2_5_VisionRotaryEmbedding, Qwen2_5_VisionTransformer,
@@ -42,7 +43,7 @@ from vllm.model_executor.models.qwen2_5_vl import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, is_enable_nz
 
 MIN_PAD_SIZE = 64  # min_size to pad weight
 MAX_PAD_SIZE = 128  # max_size to pad weight
@@ -283,6 +284,14 @@ class AscendQwen2_5_VisionTransformer(Qwen2_5_VisionTransformer):
             [qkv_weight_first_half_padded, qkv_weight_second_half_padded],
             dim=2)
         qkv_weight_final = qkv_weight_padded.reshape(-1, self.hidden_size)
+
+        if is_enable_nz(qkv_weight_final.dtype):
+            qkv_weight_final_copy = torch.empty_like(qkv_weight_final).copy_(
+                qkv_weight_final)
+            qkv_weight_final_copy = torch_npu.npu_format_cast(
+                qkv_weight_final_copy, ACL_FORMAT_FRACTAL_ND)
+            return qkv_weight_final_copy
+
         return qkv_weight_final
 
     def pad_proj_weight(self, data):
@@ -291,6 +300,13 @@ class AscendQwen2_5_VisionTransformer(Qwen2_5_VisionTransformer):
                          self.half_origin_hidden_size_per_attention_head),
             (0, self.half_pad_hidden_size_per_attention_head, 0, 0)).reshape(
                 self.hidden_size, -1)
+
+        if is_enable_nz(out_weight.dtype):
+            out_weight_copy = torch.empty_like(out_weight).copy_(out_weight)
+            out_weight_copy = torch_npu.npu_format_cast(
+                out_weight_copy, ACL_FORMAT_FRACTAL_ND)
+            return out_weight_copy
+
         return out_weight
 
     def pad_qkv_weight_scale_offset(self, data):
@@ -334,6 +350,9 @@ class AscendQwen2_5_VisionTransformer(Qwen2_5_VisionTransformer):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            ("attn.qkv.", "attn.q.", "q"),
+            ("attn.qkv.", "attn.k.", "k"),
+            ("attn.qkv.", "attn.v.", "v"),
             ("mlp.gate_up_proj.", "mlp.gate_proj.", 0),
             ("mlp.gate_up_proj.", "mlp.up_proj.", 1),
         ]
@@ -348,6 +367,11 @@ class AscendQwen2_5_VisionTransformer(Qwen2_5_VisionTransformer):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                if self.enable_pad and shard_id == "v":
+                    if "attn.qkv.weight" in name:
+                        param.data = self.pad_qkv_weight(param.data)
+                    if "attn.qkv.bias" in name:
+                        param.data = self.pad_qkv_bias(param.data)
                 break
             else:
                 param = params_dict[name]
@@ -498,20 +522,12 @@ class AscendQwen2_5_VLForConditionalGeneration(
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config: Qwen2_5_VLConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        if vllm_version_is("0.10.2"):
-            self.visual = AscendQwen2_5_VisionTransformer(
-                vision_config=config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=self._maybe_ignore_quant_config(quant_config),
-                prefix=maybe_prefix(prefix, "visual"),
-            )
-        else:
-            self.visual = AscendQwen2_5_VisionTransformer(
-                vision_config=config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+        self.visual = AscendQwen2_5_VisionTransformer(
+            vision_config=config.vision_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "visual"),
+        )
 
     def _process_image_input(self, image_input) -> tuple[torch.Tensor, ...]:
 
@@ -545,3 +561,68 @@ class AscendQwen2_5_VLForConditionalGeneration(
         merge_size = self.visual.spatial_merge_size
         sizes = grid_thw.prod(-1) // merge_size // merge_size
         return video_embeds.split(sizes.tolist())
+
+    def _get_text_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        get_input_embeddings: Callable[[torch.Tensor], torch.Tensor],
+        *,
+        is_multimodal: Optional[torch.Tensor],
+        handle_oov_mm_token: bool,
+    ) -> torch.Tensor:
+        if handle_oov_mm_token and is_multimodal is not None:
+            is_text = ~is_multimodal
+            text_embeds = get_input_embeddings(input_ids[is_text])
+
+            return torch.empty(
+                (input_ids.shape[0], text_embeds.shape[1]),
+                dtype=text_embeds.dtype,
+                device=text_embeds.device,
+            ).masked_scatter_(is_text.unsqueeze_(-1), text_embeds)
+
+        return get_input_embeddings(input_ids)
+
+    def get_input_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+        *,
+        is_multimodal: Optional[torch.Tensor] = None,
+        handle_oov_mm_token: bool = False,
+    ) -> torch.Tensor:
+        """
+        Apply token embeddings to `input_ids`.
+
+        If `multimodal_embeddings` is passed, scatter them into
+        `input_ids` according to the mask `is_multimodal`.
+
+        In case the multi-modal token IDs exceed the vocabulary size of
+        the language model, you can set `handle_oov_mm_token=False`
+        to avoid calling the language model's `get_input_embeddings` method
+        on those tokens. Note however that doing so increases memory usage
+        as an additional buffer is needed to hold the input embeddings.
+        """
+        from vllm.model_executor.models.utils import \
+            _merge_multimodal_embeddings
+
+        inputs_embeds = self._get_text_embeddings(
+            input_ids,
+            self.get_language_model().get_input_embeddings,
+            is_multimodal=is_multimodal,
+            handle_oov_mm_token=handle_oov_mm_token,
+        )
+
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+
+        if is_multimodal is None:
+            raise ValueError(
+                "`get_input_embeddings` now requires `is_multimodal` arg, "
+                "please update your model runner according to "
+                "https://github.com/vllm-project/vllm/pull/16229.")
+
+        return _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            is_multimodal=is_multimodal,
+            multimodal_embeddings=multimodal_embeddings,
+        )

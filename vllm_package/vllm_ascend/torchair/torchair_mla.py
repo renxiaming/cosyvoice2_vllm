@@ -23,9 +23,9 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
 from vllm_ascend.multistream.base import MSAttentionMetadataSplitConfig
 from vllm_ascend.multistream.context import get_multistream_comm_context
 from vllm_ascend.multistream.ms_split import model_input_split_v1_mla_attn
+from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.torchair.utils import (TorchairCommonAttentionMetadata,
                                         npu_stream_switch, npu_wait_tensor)
-from vllm_ascend.utils import npu_prefetch
 from vllm_ascend.worker.npu_input_batch import InputBatch
 
 if TYPE_CHECKING:
@@ -72,9 +72,10 @@ class AscendMLATorchairPrefillMetadata:
         max_seq_lens: list[int]
         workspace: torch.Tensor
         chunk_seq_lens: torch.Tensor
+        chunk_seq_lens_npu: torch.Tensor
 
     attn_mask: torch.Tensor
-    query_lens: list[int]
+    query_lens: torch.Tensor
     seq_lens: list[int]
     context_lens: torch.Tensor
     input_positions: torch.Tensor
@@ -462,6 +463,7 @@ class AscendMLATorchairMetadataBuilder:
                     seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
                     max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
                     chunk_seq_lens=chunk_seq_lens,
+                    chunk_seq_lens_npu=chunk_seq_lens.npu(),
                     workspace=self.chunked_prefill_workspace,
                 )
             prefill_input_positions = input_positions[tokens_start:]
@@ -473,7 +475,7 @@ class AscendMLATorchairMetadataBuilder:
                     1).unsqueeze(2)
             prefill_metadata = AscendMLATorchairPrefillMetadata(
                 attn_mask=common_attn_metadata.attn_mask,
-                query_lens=query_lens[tokens_start:],
+                query_lens=query_lens[tokens_start:].to(torch.int32),
                 seq_lens=seq_lens,
                 context_lens=seq_lens[tokens_start:],
                 input_positions=prefill_input_positions,
@@ -656,7 +658,8 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
         self.qk_head_dim = kwargs['qk_head_dim']
         self.v_head_dim = kwargs['v_head_dim']
         self.rotary_emb = kwargs['rotary_emb']
-        self.q_proj = kwargs['q_proj']
+        self.q_proj = kwargs['q_proj'] if self.q_lora_rank is None else kwargs[
+            'q_b_proj']
         self.kv_b_proj = kwargs['kv_b_proj']
         self.o_proj = kwargs['o_proj']
         self.kv_a_proj_with_mqa = kwargs.get('kv_a_proj_with_mqa', None)
@@ -684,10 +687,10 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
         if hasattr(self, "running_in_graph") and not self.running_in_graph:
             return x
         MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024  # 16MB
-        npu_prefetch(self.o_proj.weight,
-                     x,
-                     max_size=MAX_O_PROJ_PREFETCH_SIZE,
-                     enabled=enable_multistream_mla)
+        maybe_npu_prefetch(self.o_proj.weight,
+                           x,
+                           max_size=MAX_O_PROJ_PREFETCH_SIZE,
+                           enabled=enable_multistream_mla)
         return self.o_proj(x, is_prefill=False)[0]
 
     # Return `ql_nope`, `q_pe`
@@ -776,7 +779,8 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
         q_pe = query[..., self.qk_nope_head_dim:]
         q_nope = query[..., :self.qk_nope_head_dim]
 
-        seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32)
+        current_seq_len = torch.tensor(prefill_metadata.query_lens,
+                                       dtype=torch.int32)
         cache_kv_c = kv_c_and_k_pe_cache[0]
         cache_k_pe = kv_c_and_k_pe_cache[1]
         num_heads = cache_k_pe.size(2)
@@ -784,8 +788,11 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
 
-            seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i]
-            seq_len = torch.stack([seq_len1, seq_len2])
+            context_seq_len = prefill_metadata.chunked_context.chunk_seq_lens[
+                i]
+            context_seq_len_npu = prefill_metadata.chunked_context.chunk_seq_lens_npu[
+                i]
+            seq_len = torch.stack([current_seq_len, context_seq_len])
             kv_c_normed = torch.empty(toks,
                                       num_heads,
                                       latent_kv_dim,
@@ -801,7 +808,7 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
                 cache_kv_c,
                 cache_k_pe,
                 prefill_metadata.block_table,
-                seq_len2.to(query.device),
+                context_seq_len_npu,
                 seq_starts=prefill_metadata.chunked_context.starts[i],
                 key=kv_c_normed,
                 value=k_pe,
@@ -880,9 +887,7 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
                                    k_rope=k_pe,
                                    value=value,
                                    mask=self.prefill_mask,
-                                   seqlen=torch.tensor(
-                                       attn_metadata.prefill.query_lens,
-                                       dtype=torch.int32),
+                                   seqlen=attn_metadata.prefill.query_lens,
                                    head_num=self.num_heads,
                                    kv_head_num=self.num_heads,
                                    pre_out=None,
@@ -1099,7 +1104,7 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
-            return output
+            return output.fill_(0)
         self.running_in_graph = self.torchair_graph_enabled and attn_metadata.attn_state in [
             AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
         ]
@@ -1281,10 +1286,10 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
         current_ms_metadata = get_multistream_comm_context()
         MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024  # 16MB
         if current_ms_metadata is None:
-            npu_prefetch(self.o_proj.weight,
-                         o_proj_input,
-                         max_size=MAX_O_PROJ_PREFETCH_SIZE,
-                         enabled=enable_multistream_mla)
+            maybe_npu_prefetch(self.o_proj.weight,
+                               o_proj_input,
+                               max_size=MAX_O_PROJ_PREFETCH_SIZE,
+                               enabled=enable_multistream_mla)
 
             output[...] = self.o_proj(
                 o_proj_input,
@@ -1292,10 +1297,10 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
                 is_force_scatter=self.enable_shared_expert_dp)[0]
         else:
             with torch.npu.stream(current_ms_metadata.comm_stream):
-                npu_prefetch(self.o_proj.weight,
-                             o_proj_input,
-                             max_size=MAX_O_PROJ_PREFETCH_SIZE,
-                             enabled=enable_multistream_mla)
+                maybe_npu_prefetch(self.o_proj.weight,
+                                   o_proj_input,
+                                   max_size=MAX_O_PROJ_PREFETCH_SIZE,
+                                   enabled=enable_multistream_mla)
                 output[...] = self.o_proj(
                     o_proj_input,
                     is_prefill=True,

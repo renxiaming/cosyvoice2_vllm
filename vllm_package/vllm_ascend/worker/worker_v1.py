@@ -44,10 +44,11 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.platform import NPUPlatform
-from vllm_ascend.utils import (init_ascend_soc_version,
+from vllm_ascend.utils import (init_ascend_soc_version, is_enable_nz,
                                register_ascend_customop, sleep_mode_enabled,
                                try_register_lib)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -80,6 +81,7 @@ class NPUWorker(WorkerBase):
         # register patch for vllm
         from vllm_ascend.utils import adapt_patch
         adapt_patch()
+        is_enable_nz(vllm_config=vllm_config)
         # Register ops when worker init.
         from vllm_ascend import ops
         ops.register_dummy_fusion_op()
@@ -88,7 +90,11 @@ class NPUWorker(WorkerBase):
         # init ascend config and soc version
         init_ascend_config(vllm_config)
         init_ascend_soc_version()
-        if get_ascend_config().use_sfa:
+        use_sparse = False
+        if vllm_config.model_config is not None:
+            use_sparse = hasattr(vllm_config.model_config.hf_config,
+                                 "index_topk")
+        if use_sparse:
             # Direct import instead of using try_register_lib to ensure proper error handling when
             # custom_ops is necessary but not available (e.g., in DeepSeek v3.2 deployments)
             # yapf: disable
@@ -105,6 +111,17 @@ class NPUWorker(WorkerBase):
                          rank=rank,
                          distributed_init_method=distributed_init_method,
                          is_driver_worker=is_driver_worker)
+
+        # binding cpu
+        if get_ascend_config().enable_cpu_binding:
+            try:
+                bind_cpus(self.local_rank, ratio=1.0)
+            except RuntimeError as e:
+                logger.error(f"{e} in {self.local_rank}")
+            except ValueError as e:
+                logger.error(f"{e} in {self.local_rank}")
+            except Exception:
+                logger.info("Skip binding cpu.")
 
         # Try to import mindie_turbo to accelerate vLLM inference.
         try_register_lib(
@@ -162,6 +179,11 @@ class NPUWorker(WorkerBase):
             raise ValueError(
                 "Sleep mode is not enabled. Please compile vllm-ascend with COMPILE_CUSTOM_KERNELS=1."
             )
+
+        if is_enable_nz():
+            raise ValueError(
+                "FRACTAL_NZ mode is enabled. This may cause model parameter precision issues "
+                "in the RL scenarios. Please set VLLM_ASCEND_ENABLE_NZ=0.")
         allocator = CaMemAllocator.get_instance()
         allocator.wake_up(tags=tags)
 
@@ -356,7 +378,9 @@ class NPUWorker(WorkerBase):
         return self.model_runner.pin_lora(lora_id)
 
     def execute_dummy_batch(self) -> None:
-        self.model_runner._dummy_run(1)
+        self.model_runner._dummy_run(
+            num_tokens=self.model_runner.decode_token_per_req,
+            uniform_decode=True)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

@@ -30,6 +30,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request, RequestStatus
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.distributed.utils import get_transfer_timeout_value
 from vllm_ascend.utils import AscendSocVersion, get_ascend_soc_version
 
 TORCH_DTYPE_TO_NPU_DTYPE = {
@@ -180,7 +181,10 @@ class LLMDataDistCMgrConnectorScheduler():
         # Can not retrieve the parallel config since it is not initialized.
         self.local_dp_rank = None
         self.tp_size = None
-        dp_rank_local = self.vllm_config.parallel_config.data_parallel_rank_local
+        if vllm_config.parallel_config.data_parallel_external_lb:
+            dp_rank_local = vllm_config.parallel_config.data_parallel_rank
+        else:
+            dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
 
         self.port = dp_rank_local * tp_size + envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT if dp_rank_local is not None else tp_size + envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT
@@ -312,7 +316,10 @@ class LLMDataDistCMgrConnectorWorker():
             vllm_config.parallel_config.data_parallel_size_local *
             vllm_config.parallel_config.tensor_parallel_size)
         self.local_rank = get_world_group().local_rank
-        self.local_dp_rank = vllm_config.parallel_config.data_parallel_rank_local
+        if vllm_config.parallel_config.data_parallel_external_lb:
+            self.local_dp_rank = vllm_config.parallel_config.data_parallel_rank
+        else:
+            self.local_dp_rank = vllm_config.parallel_config.data_parallel_rank_local
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.tp_rank = get_tp_group().rank_in_group
         self.rank = get_world_group().rank
@@ -405,7 +412,7 @@ class LLMDataDistCMgrConnectorWorker():
         assert self.local_agent_metadata is not None
         llm_config = LLMConfig()
         llm_config.device_id = self.local_rank
-        llm_config.sync_kv_timeout = 20000
+        llm_config.sync_kv_timeout = get_transfer_timeout_value()
         llm_config.enable_switch_role = True
         llm_config.enable_cache_manager = True
         llm_config.enable_remote_cache_accessible = True
@@ -495,7 +502,7 @@ class LLMDataDistCMgrConnectorWorker():
         self.use_mla: bool = first_kv_cache_tuple[0].size(
             -1) != first_kv_cache_tuple[1].size(-1) and len(
                 first_kv_cache_tuple) == 2
-        self.use_sfa: bool = len(first_kv_cache_tuple) == 3
+        self.use_sparse: bool = len(first_kv_cache_tuple) == 3
         # MLA case. [2 (k_normed, k_pe), num_blocks, ...]
         # SFA case. [3 (k_normed, k_pe, k_idx), num_blocks, ...]
         # MHA case. [2 (k and v), num_blocks, ...]
@@ -543,7 +550,7 @@ class LLMDataDistCMgrConnectorWorker():
                 raise RuntimeError(
                     f"LLMDataDistCMgrConnectorWorker: Passing unexpected parameter to register_block_cache, receiving [cache_desc: {self.cache_desc}, cache_addr: {self.cache_addr}, cache_key: {self.cache_key}]"
                 )
-        elif self.use_sfa:
+        elif self.use_sparse:
             cache_k_normed_addr_list = []
             cache_k_pe_addr_list = []
             cache_k_idx_addr_list = []
@@ -881,7 +888,7 @@ class LLMDataDistCMgrConnectorWorker():
                 raise RuntimeError(
                     "LLMDataDistCMgrConnectorWorker: Timeout during pull_blocks, you can try to increase the sync_kv_timeout config or checking your connect status"
                 )
-        elif self.use_sfa:
+        elif self.use_sparse:
             remote_cache_key_k_normed = BlocksCacheKey(
                 cluster_id=remote_cluster_id, model_id=0)
             remote_cache_key_k_pe = BlocksCacheKey(

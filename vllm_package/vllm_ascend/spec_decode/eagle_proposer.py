@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from vllm.attention.layer import Attention
-from vllm.config import (CompilationLevel, VllmConfig,
+from vllm.config import (CompilationLevel, CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config)
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
@@ -21,7 +21,6 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.spec_decode.interface import Proposer, SpecDcodeType
-from vllm_ascend.utils import vllm_version_is
 
 PADDING_SLOT_ID = -1
 
@@ -73,7 +72,7 @@ class EagleProposer(Proposer):
                                    dtype=torch.int32)
         attn_mask_len = self.vllm_config.model_config.max_model_len
         self.attn_mask_builder = AttentionMaskBuilder(
-            attn_mask_len, self.vllm_config.model_config.dtype)
+            attn_mask_len, self.vllm_config.model_config.dtype, device=device)
 
     def load_model(self, model: nn.Module) -> None:
         target_attn_layer_names = set(
@@ -115,7 +114,10 @@ class EagleProposer(Proposer):
                   with_prefill: bool = False,
                   skip_attn: bool = False,
                   num_reqs: int = 0,
-                  num_tokens_across_dp: Optional[torch.Tensor] = None):
+                  num_tokens_across_dp: Optional[torch.Tensor] = None,
+                  aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+                  batch_descriptor=None,
+                  dummy_compute_logits=lambda hidden_states: None):
         moe_comm_type = self.runner._select_moe_comm_method(
             num_tokens, with_prefill)
         with set_ascend_forward_context(None,
@@ -127,6 +129,7 @@ class EagleProposer(Proposer):
                 positions=self.positions[:num_tokens],
                 hidden_states=self.hidden_states[:num_tokens],
             )
+            dummy_compute_logits(self.hidden_states)
 
     def generate_token_ids(self,
                            valid_sampled_token_ids: list[list[int]],
@@ -352,10 +355,7 @@ class EagleProposer(Proposer):
                 decode_token_per_req=self.runner.decode_token_per_req,
                 num_computed_tokens_cpu=None,
                 seq_lens=None)
-            if vllm_version_is("0.10.2"):
-                builder = self.runner.attn_groups[0][0].metadata_builder
-            else:
-                builder = self.runner.attn_groups[0][0].get_metadata_builder()
+            builder = self.runner.attn_groups[0][0].get_metadata_builder()
             attn_metadata_i = builder.build(0, common_attn_metadata,
                                             self.runner.get_model())
             for layer_name in kv_cache_group_spec.layer_names:
@@ -424,9 +424,7 @@ class EagleProposer(Proposer):
 
         query_lens = cu_num_tokens[1:] - cu_num_tokens[:-1]
         max_query_len = query_lens.max().item()
-        attn_mask = self.attn_mask_builder.get_splitfuse_attn_mask(
-            seq_lens, target_positions, self.vllm_config.model_config.dtype,
-            self.device)
+        attn_mask = self.runner.attn_mask
 
         common_attn_metadata = AscendCommonAttentionMetadata(
             query_start_loc=cu_num_tokens.to(device),
@@ -447,10 +445,7 @@ class EagleProposer(Proposer):
             num_computed_tokens_cpu=None,
             seq_lens=None)
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
-        if vllm_version_is("0.10.2"):
-            builder = self.runner.attn_groups[0][0].metadata_builder
-        else:
-            builder = self.runner.attn_groups[0][0].get_metadata_builder()
+        builder = self.runner.attn_groups[0][0].get_metadata_builder()
         attn_metadata = builder.build(0, common_attn_metadata,
                                       self.runner.get_model())
         if self.use_cuda_graph and \
@@ -479,10 +474,7 @@ class EagleProposer(Proposer):
                 hidden_states=self.hidden_states[:num_input_tokens],
             )
         sample_hidden_states = last_hidden_states[last_token_indices]
-        if vllm_version_is("0.10.2"):
-            logits = self.model.compute_logits(sample_hidden_states, None)
-        else:
-            logits = self.model.compute_logits(sample_hidden_states)
+        logits = self.model.compute_logits(sample_hidden_states)
         draft_token_ids = logits.argmax(dim=-1)
 
         # Early exit if there is only one draft token to be generated.
@@ -512,9 +504,15 @@ class EagleProposer(Proposer):
         attn_metadata.num_actual_tokens = batch_size
         attn_metadata.max_query_len = 1
         attn_metadata.query_start_loc = self.arange[:batch_size + 1]
+        attn_metadata.query_start_loc_list = attn_metadata.query_start_loc[
+            1:].tolist()
+        attn_metadata.num_decodes, attn_metadata.num_prefills, attn_metadata.num_decode_tokens, attn_metadata.num_prefill_tokens = 0, batch_size, 0, batch_size
+        attn_metadata.num_actual_tokens_pcp_padded = attn_metadata.num_decode_tokens + attn_metadata.num_prefill_tokens
         query_lens.fill_(1)
         attn_metadata.query_lens = query_lens
 
+        attn_metadata.actual_seq_lengths_q = [1 + i for i in range(batch_size)]
+        attn_metadata.seq_lens_list = seq_lens.tolist()
         attn_metadata.attn_state = AscendAttentionState.ChunkedPrefill
         for now_speculative in range(
                 self.vllm_config.speculative_config.num_speculative_tokens -
@@ -541,6 +539,9 @@ class EagleProposer(Proposer):
             # TODO: Increment the sequence lengths.
 
             attn_metadata.seq_lens += 1
+            attn_metadata.seq_lens_list = [
+                _ + 1 for _ in attn_metadata.seq_lens_list
+            ]
             # TODO: Consider max model length.
             # attn_metadata.max_seq_len = min(attn_metadata.max_seq_len,
             #                                 self.max_model_len)
@@ -586,12 +587,7 @@ class EagleProposer(Proposer):
                     hidden_states=self.hidden_states[:input_batch_size],
                 )
             hidden_states = hidden_states[:batch_size]
-            if vllm_version_is("0.10.2"):
-                logits = self.model.compute_logits(
-                    last_hidden_states[:batch_size], None)
-            else:
-                logits = self.model.compute_logits(
-                    last_hidden_states[:batch_size])
+            logits = self.model.compute_logits(last_hidden_states[:batch_size])
 
             # TODO(wenlong): get more than one token for tree attention
             draft_token_ids = logits.argmax(dim=-1)

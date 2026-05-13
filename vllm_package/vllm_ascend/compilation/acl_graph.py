@@ -189,41 +189,173 @@ class ACLGraphWrapper:
         return entry.output
 
 
-def update_attn_params(update_stream, forward_context, runtime_shape):
+def update_attn_params(update_stream,
+                       forward_context,
+                       runtime_shape,
+                       kv_transfer_config=None):
+    graph_params = get_graph_params()
+
+    # NOTE(Angazenn): By moving the npu-stream context ahead,
+    # (see https://github.com/vllm-project/vllm-ascend/pull/3985)
+    # we can reduce host overhead introduced by stream initialization.
+    # However, we find that this might cause potential accuracy problems
+    # with pd-disaggreagation. Therefore, this optimization is only enabled
+    # without pd-disaggreagation. We are working on to solve this problem
+    # directly int the future.
+    if kv_transfer_config is not None:
+        for key, param, handle, event in zip(
+                forward_context.attn_metadata,
+                graph_params.attn_params[runtime_shape],
+                graph_params.handles[runtime_shape],
+                graph_params.events[runtime_shape],
+        ):
+            (
+                query,
+                key_cache,
+                value_cache,
+                num_kv_heads,
+                num_heads,
+                scale,
+                block_table,
+                seq_lens,
+                output,
+            ) = param
+            seq_lens = forward_context.attn_metadata[key].seq_lens
+
+            # When using FULL_DECODE_ONLY, there are some rare bugs for FULL_DECODE_ONLY
+            # mode with GQA. This is triggered by getting workspace for _npu_paged_attention
+            # in torch_npu. On some cases, _npu_paged_attention requires different workspace
+            # among various seq_lens. So additional get_workspace is added here
+            # to avoid such bugs.
+            # TODO(Angazenn): we will remove this once _npu_paged_attention is fully
+            # replaced by npu_fused_infer_attention_score which does not contain such bugs.
+            workspace = torch_npu._npu_paged_attention_get_workspace(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                num_kv_heads=num_kv_heads,
+                num_heads=num_heads,
+                scale_value=scale,
+                block_table=block_table,
+                context_lens=seq_lens,
+                out=output)
+
+            with torch.npu.stream(update_stream):
+                torch.npu.graph_task_update_begin(update_stream, handle)
+                torch_npu._npu_paged_attention(query=query,
+                                               key_cache=key_cache,
+                                               value_cache=value_cache,
+                                               num_kv_heads=num_kv_heads,
+                                               num_heads=num_heads,
+                                               scale_value=scale,
+                                               block_table=block_table,
+                                               context_lens=seq_lens,
+                                               out=output,
+                                               workspace=workspace)
+                torch.npu.graph_task_update_end(update_stream)
+
+                event.record(update_stream)
+    else:
+        with torch.npu.stream(update_stream):
+            for key, param, handle, event in zip(
+                    forward_context.attn_metadata,
+                    graph_params.attn_params[runtime_shape],
+                    graph_params.handles[runtime_shape],
+                    graph_params.events[runtime_shape],
+            ):
+                (
+                    query,
+                    key_cache,
+                    value_cache,
+                    num_kv_heads,
+                    num_heads,
+                    scale,
+                    block_table,
+                    seq_lens,
+                    output,
+                ) = param
+                seq_lens = forward_context.attn_metadata[key].seq_lens
+
+                workspace = torch_npu._npu_paged_attention_get_workspace(
+                    query=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    num_kv_heads=num_kv_heads,
+                    num_heads=num_heads,
+                    scale_value=scale,
+                    block_table=block_table,
+                    context_lens=seq_lens,
+                    out=output)
+                torch.npu.graph_task_update_begin(update_stream, handle)
+                torch_npu._npu_paged_attention(query=query,
+                                               key_cache=key_cache,
+                                               value_cache=value_cache,
+                                               num_kv_heads=num_kv_heads,
+                                               num_heads=num_heads,
+                                               scale_value=scale,
+                                               block_table=block_table,
+                                               context_lens=seq_lens,
+                                               out=output,
+                                               workspace=workspace)
+                torch.npu.graph_task_update_end(update_stream)
+
+                event.record(update_stream)
+
+
+def update_mla_attn_params(update_stream, forward_context, runtime_shape,
+                           speculative_config):
     graph_params = get_graph_params()
     # FIXME: Behold! We are using a temporary hack here to update the args
     # for each layer's attention op in the graph.
-    for key, param, handle, event in zip(
-            forward_context.attn_metadata,
-            graph_params.attn_params[runtime_shape],
-            graph_params.handles[runtime_shape],
-            graph_params.events[runtime_shape],
-    ):
-        (
-            query,
-            key_cache,
-            value_cache,
-            num_kv_heads,
-            num_heads,
-            scale,
-            block_table,
-            seq_lens,
-            output,
-        ) = param
-        # block_table = forward_context.attn_metadata[key].block_tables
-        seq_lens = forward_context.attn_metadata[key].seq_lens
+    with torch.npu.stream(update_stream):
+        for key, param, handle, event in zip(
+                forward_context.attn_metadata,
+                graph_params.attn_params[runtime_shape],
+                graph_params.handles[runtime_shape],
+                graph_params.events[runtime_shape],
+        ):
+            (q_nope, k_nope, q_pe, k_pe, num_heads, num_kv_heads, input_layout,
+             spec_attn_mask, sparse_mode, scale, block_table, block_size,
+             seq_lens_list, actual_seq_lengths, attn_output,
+             softmax_lse) = param
+            seq_lens_list = forward_context.attn_metadata[
+                key].decode.seq_lens_list
+            if speculative_config and speculative_config.method == "deepseek_mtp":
+                actual_seq_lengths = forward_context.attn_metadata[
+                    key].decode.actual_seq_lengths_q
+                spec_multiple = speculative_config.num_speculative_tokens + 1
+                seq_lens_list = seq_lens_list + [0] * (
+                    runtime_shape // spec_multiple - len(seq_lens_list))
+                actual_seq_lengths = [
+                    spec_multiple * (i + 1)
+                    for i in range(runtime_shape // spec_multiple)
+                ]
+            else:
+                seq_lens_list = seq_lens_list + [0] * (runtime_shape -
+                                                       len(seq_lens_list))
 
-        with torch.npu.stream(update_stream):
             torch.npu.graph_task_update_begin(update_stream, handle)
-            torch_npu._npu_paged_attention(query=query,
-                                           key_cache=key_cache,
-                                           value_cache=value_cache,
-                                           num_kv_heads=num_kv_heads,
-                                           num_heads=num_heads,
-                                           scale_value=scale,
-                                           block_table=block_table,
-                                           context_lens=seq_lens,
-                                           out=output)
+
+            torch_npu.npu_fused_infer_attention_score.out(
+                q_nope,
+                k_nope,
+                k_nope,
+                query_rope=q_pe,
+                key_rope=k_pe,
+                num_heads=num_heads,
+                num_key_value_heads=num_kv_heads,
+                input_layout=input_layout,
+                atten_mask=spec_attn_mask,
+                sparse_mode=sparse_mode,
+                scale=scale,
+                antiquant_mode=0,
+                antiquant_scale=None,
+                block_table=block_table,
+                block_size=block_size,
+                actual_seq_lengths_kv=seq_lens_list,
+                actual_seq_lengths=actual_seq_lengths,
+                workspace=graph_params.workspaces.get(runtime_shape),
+                out=[attn_output, softmax_lse])
             torch.npu.graph_task_update_end(update_stream)
 
             event.record(update_stream)
@@ -254,6 +386,12 @@ def set_graph_params(aclgraph_capture_sizes: set[int]):
         {size: []
          for size in aclgraph_capture_sizes},
     )
+
+
+def update_graph_params_workspaces(num_tokens: int, workspace: Any):
+    global _graph_params
+    if _graph_params is not None:
+        _graph_params.workspaces[num_tokens] = workspace
 
 
 def get_graph_params():

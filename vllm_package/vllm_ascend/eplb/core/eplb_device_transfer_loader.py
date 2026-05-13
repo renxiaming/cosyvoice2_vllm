@@ -45,13 +45,9 @@ class D2DExpertWeightLoader:
                                           layer_id):
         # When current send/recv and weight.expert_map update tasks are not finished, cannot accept new d2d task
         if self.state != ExpertWeightUpdateState.WAITING:
-            logger.error(
+            logger.warning_once(
                 "current d2d weight update tasks are on-going, cannot accept new weight update task"
             )
-            return
-
-        # If neither send nor receive task is needed for this layer on this rank, return
-        if not (expert_send_info or expert_recv_info):
             return
 
         self.updated_expert_map = updated_expert_map
@@ -64,6 +60,7 @@ class D2DExpertWeightLoader:
                 layer_id][global_expert_id_to_send].item()
             for src_tensor in self.eplb_adaptor.expert_param_per_layer[
                     layer_id][local_expert_id]:
+                src_tensor = src_tensor.clone()
                 self.comm_op_list.append(
                     dist.P2POp(dist.isend, src_tensor, dst_rank))
 

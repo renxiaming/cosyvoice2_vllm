@@ -29,12 +29,14 @@ from vllm.distributed import (GroupCoordinator, get_tensor_model_parallel_rank,
 from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
                                              get_tp_group)
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.config import \
     FusedMoEConfig  # isort: skip
 from vllm.model_executor.layers.fused_moe.config import \
     FusedMoEParallelConfig  # isort: skip
 from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE, UnquantizedFusedMoEMethod, determine_expert_map)
+    FusedMoE, UnquantizedFusedMoEMethod, determine_expert_map,
+    get_compressed_expert_map)
 from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
 
@@ -46,12 +48,13 @@ from vllm_ascend.eplb.core.eplb_utils import (determine_default_expert_map,
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
 from vllm_ascend.quantization.quant_config import AscendFusedMoEMethod
 from vllm_ascend.torchair.ops.sequence_parallel import MetadataForPadding
-from vllm_ascend.torchair.utils import npu_stream_switch, npu_wait_tensor
+from vllm_ascend.torchair.utils import (get_all_reduce_merge_state,
+                                        get_rm_router_logits_state,
+                                        npu_stream_switch, npu_wait_tensor,
+                                        super_kernel)
 from vllm_ascend.utils import (AscendSocVersion, dispose_tensor,
-                               get_all_reduce_merge_state,
-                               get_ascend_soc_version,
-                               get_rm_router_logits_state, is_310p,
-                               vllm_version_is)
+                               get_ascend_soc_version, is_310p,
+                               is_hierarchical_communication_enabled)
 
 
 def torchair_fused_experts_with_mc2(
@@ -78,6 +81,10 @@ def torchair_fused_experts_with_mc2(
 
     # NOTE: Currently, when in A3, we need to pass in some extra param into dispatch & combine
     a3_need_extra_args = get_ascend_soc_version() == AscendSocVersion.A3
+    # NOTE: When in A2, setting the environment variables HCCL_INTRA_PCIE_ENABLE=1 and
+    # HCCL_INTRA_ROCE_ENABLE=0 can reduce cross-machine communication traffic and significantly
+    # improve communication performance.
+    need_expert_scale = is_hierarchical_communication_enabled()
 
     enable_dispatch_v2 = hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
 
@@ -108,6 +115,10 @@ def torchair_fused_experts_with_mc2(
         stage1_kwargs.update({
             "x_active_mask": mc2_mask,
         })
+    if need_expert_scale:
+        stage1_kwargs.update({
+            "expert_scales": topk_weights.to(torch.float32),
+        })
 
     kwargs_mc2.update(stage1_kwargs)
 
@@ -116,8 +127,8 @@ def torchair_fused_experts_with_mc2(
     ) if enable_dispatch_v2 else torch_npu.npu_moe_distribute_dispatch(
         **kwargs_mc2)
     # comm_stream.wait_stream(torch.npu.current_stream())
-    expand_x, dynamic_scale, assist_info_for_combine, expert_token_nums, ep_recv_counts = output[
-        0:5]
+    expand_x, dynamic_scale, assist_info_for_combine, expert_token_nums, \
+        ep_recv_counts, _, expand_scales = output[0:7]
 
     if shared_experts is not None:
         with npu_stream_switch("moe_secondary", 0):
@@ -167,6 +178,7 @@ def torchair_fused_experts_with_mc2(
         "group_ep": moe_all_to_all_group_name,
         "ep_world_size": ep_world_size,
         "ep_rank_id": ep_rank_id,
+        "expand_scales": expand_scales,
     }
     if enable_dispatch_v2:
         stage3_kwargs.update({
@@ -845,43 +857,26 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         shared_experts: Optional[Any] = None,
         **kwargs,
     ) -> torch.Tensor:
-
-        is_deepseek_v3_r1 = global_num_experts == 256
-        # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
-        if is_deepseek_v3_r1:
-            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
-                router_logits,
-                k=top_k,  # topk currently is 8
-                bias=e_score_correction_bias,
-                k_group=topk_group,  # fix: 4
-                group_count=num_expert_group,  # fix 8
-                group_select_mode=
-                1,  # 0: the maximum in the group; 1: topk2.sum(fix)
-                renorm=0,  # 0: softmax->topk(fix); 1: topk->softmax
-                norm_type=1,  # 0: softmax; 1: sigmoid(fix)
-                # out_flag=False, # todo new api; should the third output be output
-                # y2_flag=False, # old api; should the third output be output
-                routed_scaling_factor=1,
-                eps=float(1e-20))
-        else:
-            topk_weights, topk_ids = torchair_select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                top_k=top_k,
-                use_grouped_topk=use_grouped_topk,
-                renormalize=renormalize,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                custom_routing_function=custom_routing_function,
-                scoring_func=scoring_func,
-                e_score_correction_bias=e_score_correction_bias,
-            )
+        topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
+            router_logits,
+            k=top_k,  # topk currently is 8
+            bias=e_score_correction_bias,
+            k_group=topk_group,  # fix: 4
+            group_count=num_expert_group,  # fix 8
+            group_select_mode=
+            1,  # 0: the maximum in the group; 1: topk2.sum(fix)
+            renorm=0,  # 0: softmax->topk(fix); 1: topk->softmax
+            norm_type=1,  # 0: softmax; 1: sigmoid(fix)
+            # out_flag=False, # todo new api; should the third output be output
+            # y2_flag=False, # old api; should the third output be output
+            routed_scaling_factor=1,
+            eps=float(1e-20))
 
         topk_weights = topk_weights.to(x.dtype)
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
-        if enable_force_load_balance and not self.use_aclgraph:
+        if enable_force_load_balance:
             topk_ids = torch.randint_like(topk_ids, 0, global_num_experts)
 
         fused_moe_state = get_forward_context().fused_moe_state
@@ -900,6 +895,7 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 expert_map=expert_map,
                 moe_all_to_all_group_name=self.moe_all_to_all_group_name,
                 shared_experts=shared_experts,
+                is_torchair=self.torchair_graph_enabled,
                 mc2_mask=kwargs.get("mc2_mask", None))
         elif fused_moe_state in [
                 FusedMoEState.AllGather, FusedMoEState.NaiveMulticast
@@ -977,6 +973,7 @@ class TorchairAscendFusedMoE(FusedMoE):
         )
         TorchairAscendFusedMoE.moe_counter += 1
         self.moe_instance_id = TorchairAscendFusedMoE.moe_counter
+        self.prefix = prefix
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -1017,7 +1014,7 @@ class TorchairAscendFusedMoE(FusedMoE):
             self.moe_parallel_config.ep_size, is_deepseek_v3_r1)
 
         ascend_config = get_ascend_config()
-        self.dynamic_eplb = ascend_config.dynamic_eplb
+        self.dynamic_eplb = ascend_config.dynamic_eplb or ascend_config.expert_map_record_path
         self.expert_map_path = ascend_config.expert_map_path
         self.global_redundant_expert_num = ascend_config.init_redundancy_expert
         self.global_num_experts = num_experts + self.global_redundant_expert_num
@@ -1027,13 +1024,31 @@ class TorchairAscendFusedMoE(FusedMoE):
                                                     os.R_OK):
             self.expert_load_balancer = ExpertLoadBalancer(
                 self.expert_map_path, self.global_num_experts)
-            self.local_num_experts, self.expert_map = (
-                self.expert_load_balancer.get_rank_placement_map(
-                    self.moe_instance_id, self.ep_rank))
-            self.log2phy = self.expert_load_balancer.get_rank_log2phy_map(
-                self.moe_instance_id, self.ep_rank).npu()
+            self.expert_load_balancer.check_expert_map_tensor()
             self.global_redundant_expert_num = (
                 self.expert_load_balancer.get_global_redundant_expert_num())
+            try:
+                self.local_num_experts, self.expert_map = (
+                    self.expert_load_balancer.get_rank_placement_map(
+                        self.moe_instance_id, self.ep_rank))
+                self.log2phy = self.expert_load_balancer.get_rank_log2phy_map(
+                    self.moe_instance_id, self.ep_rank).npu()
+            except Exception as e:
+                logger.warning(
+                    f"Init expert map of mtp/eagle when using sample.{e}")
+                self.local_num_experts, self.expert_map = determine_default_expert_map(
+                    self.global_num_experts, self.ep_size, self.ep_rank,
+                    self.global_redundant_expert_num)
+                self.log2phy = determine_default_log2phy_map(
+                    self.global_num_experts, self.ep_size, self.ep_rank).npu()
+            if self.expert_map is not None and isinstance(
+                    self.expert_map, torch.Tensor):
+                logger.info_once(
+                    "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
+                    " number of experts: %s/%s. Experts local to global index map:"
+                    " %s.", self.ep_rank, self.ep_size, self.local_num_experts,
+                    self.global_num_experts,
+                    get_compressed_expert_map(self.expert_map))
         else:
             # init moe.
             self.local_num_experts, self.expert_map = determine_expert_map(
@@ -1045,42 +1060,39 @@ class TorchairAscendFusedMoE(FusedMoE):
                     self.global_num_experts, self.ep_size, self.ep_rank,
                     self.global_redundant_expert_num)
                 self.log2phy = determine_default_log2phy_map(
-                    self.global_num_experts, self.ep_size, self.ep_rank,
-                    self.global_redundant_expert_num)
+                    self.global_num_experts, self.ep_size, self.ep_rank).npu()
+            if self.expert_map is not None and isinstance(
+                    self.expert_map, torch.Tensor):
+                logger.info_once(
+                    "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
+                    " number of experts: %s/%s. Experts local to global index map:"
+                    " %s.", self.ep_rank, self.ep_size, self.local_num_experts,
+                    self.global_num_experts,
+                    get_compressed_expert_map(self.expert_map))
         local_num_experts = (torch.sum(self.expert_map != -1)
                              if self.expert_map is not None else num_experts)
         if self.dynamic_eplb:
-            self.moe_load = torch.zeros(local_num_experts, dtype=torch.int64)
+            self.moe_load = torch.zeros(local_num_experts,
+                                        dtype=torch.int64).npu()
 
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
         self.multistream_overlap_shared_expert = \
             ascend_config.multistream_overlap_shared_expert and \
             self.torchair_graph_enabled
+        self.enable_super_kernel = ascend_config.torchair_graph_config.enable_super_kernel
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError("Only softmax scoring function is supported for "
                              "non-grouped topk.")
-
-        if vllm_version_is("0.10.2"):
-            self.moe = FusedMoEConfig.make(
-                num_experts=self.global_num_experts,
-                experts_per_token=top_k,
-                hidden_dim=hidden_size,
-                num_local_experts=self.local_num_experts,
-                moe_parallel_config=self.moe_parallel_config,
-                # TODO (bnell): this needs to be fixed for quantized types.
-                in_dtype=params_dtype,
-                quant_config=quant_config)
-        else:
-            self.moe = FusedMoEConfig(
-                num_experts=self.global_num_experts,
-                experts_per_token=top_k,
-                hidden_dim=hidden_size,
-                num_local_experts=self.local_num_experts,
-                moe_parallel_config=self.moe_parallel_config,
-                in_dtype=params_dtype,
-            )
+        self.moe = FusedMoEConfig(
+            num_experts=self.global_num_experts,
+            experts_per_token=top_k,
+            hidden_dim=hidden_size,
+            num_local_experts=self.local_num_experts,
+            moe_parallel_config=self.moe_parallel_config,
+            in_dtype=params_dtype,
+        )
         if quant_config is None:
             self.quant_method = TorchairAscendUnquantizedFusedMoEMethod(
                 self.moe)
@@ -1164,16 +1176,24 @@ class TorchairAscendFusedMoE(FusedMoE):
         quantized_x_for_share, dynamic_scale_for_share = None, None
         from vllm_ascend.torchair.quantization.torchair_w8a8_dynamic import \
             TorchairAscendW8A8DynamicFusedMoEMethod
+        running_in_super_kernel = self.enable_super_kernel and fused_moe_state == FusedMoEState.MC2
+
         if self.multistream_overlap_shared_expert:
-            if not self.rm_router_logits:
-                router_logits, _ = gate(hidden_states)
-            if hasattr(self.quant_method, "quant_method") and \
-               isinstance(self.quant_method.quant_method,
-                          TorchairAscendW8A8DynamicFusedMoEMethod
-                          ) and fused_moe_state == FusedMoEState.MC2:
-                with npu_stream_switch("moe_secondary", 0):
-                    quantized_x_for_share, dynamic_scale_for_share = torch_npu.npu_dynamic_quant(
-                        hidden_states)
+            with super_kernel(self.prefix,
+                              "stream-fusion=1",
+                              enabled=running_in_super_kernel):
+                if not self.rm_router_logits:
+                    if self.enable_super_kernel:
+                        router_logits, _ = gate(hidden_states.float())
+                    else:
+                        router_logits, _ = gate(hidden_states)
+                if hasattr(self.quant_method, "quant_method") and \
+                isinstance(self.quant_method.quant_method,
+                            TorchairAscendW8A8DynamicFusedMoEMethod
+                            ) and fused_moe_state == FusedMoEState.MC2:
+                    with npu_stream_switch("moe_secondary", 0):
+                        quantized_x_for_share, dynamic_scale_for_share = torch_npu.npu_dynamic_quant(
+                            hidden_states)
 
         if shared_experts:
             if not self.multistream_overlap_shared_expert or fused_moe_state != FusedMoEState.MC2:
@@ -1242,12 +1262,8 @@ class TorchairAscendFusedMoE(FusedMoE):
                     router_logits = get_dp_group().all_gather(router_logits, 0)
 
             elif fused_moe_state == FusedMoEState.NaiveMulticast:
-                if vllm_version_is("0.10.2"):
-                    cu_tokens_across_dp_cpu = get_forward_context(
-                    ).dp_metadata.cu_tokens_across_dp_cpu
-                else:
-                    cu_tokens_across_dp_cpu = get_forward_context(
-                    ).dp_metadata.cu_tokens_across_sp(1)
+                cu_tokens_across_dp_cpu = get_forward_context(
+                ).dp_metadata.cu_tokens_across_sp(1)
                 hidden_states = self.naive_multicast(hidden_states,
                                                      cu_tokens_across_dp_cpu)
                 if self.rm_router_logits:
@@ -1281,22 +1297,35 @@ class TorchairAscendFusedMoE(FusedMoE):
             mc2_mask=mc2_mask,
             quantized_x_for_share=quantized_x_for_share,
             dynamic_scale_for_share=dynamic_scale_for_share,
+            prefix=self.prefix,
+            running_in_super_kernel=running_in_super_kernel,
         )
 
         if shared_experts:
-            if isinstance(e_hidden_states, tuple):
+            if isinstance(e_hidden_states,
+                          tuple) and len(e_hidden_states) == 2:
                 e_hidden_states, shared_hidden_states = e_hidden_states
 
-        if self.dynamic_eplb and isinstance(
+        if isinstance(e_hidden_states, tuple) and len(e_hidden_states) == 4:
+            e_hidden_states, shared_hidden_states, group_list_type, expert_tokens = e_hidden_states
+            if self.dynamic_eplb:
+                self.moe_load += expert_tokens if group_list_type else \
+                torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
+
+        if shared_experts is None and isinstance(
                 e_hidden_states, tuple) and len(e_hidden_states) == 3:
-            self.moe_load += e_hidden_states[2] if e_hidden_states[1] == 0 else \
-                torch.cat(e_hidden_states[2][:1], e_hidden_states[2][1:] - e_hidden_states[2][:-1])
+            e_hidden_states, group_list_type, expert_tokens = e_hidden_states
+            if self.dynamic_eplb:
+                self.moe_load += expert_tokens if group_list_type else \
+                    torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
 
         if (fused_moe_state not in [
                 FusedMoEState.AllGather, FusedMoEState.AllGatherEP,
                 FusedMoEState.NaiveMulticast
         ] and not replace_allreduce and not self.enable_shared_expert_dp):
             if tp_size > 1:
+                if isinstance(e_hidden_states, tuple):
+                    e_hidden_states = e_hidden_states[0]
                 dist.all_gather(list(chunk_hidden_states), e_hidden_states,
                                 self.tp_group)
                 final_hidden_states = torch.cat(chunk_hidden_states, dim=0)
@@ -1343,7 +1372,7 @@ class TorchairAscendFusedMoE(FusedMoE):
         return self.expert_map
 
     def get_log2phy_map(self):
-        return self.logical_to_physical_map
+        return self.log2phy
 
     def clear_moe_load(self):
         if self.moe_load is not None:

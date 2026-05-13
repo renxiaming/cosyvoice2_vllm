@@ -20,7 +20,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
@@ -31,7 +30,8 @@ from vllm.distributed.parallel_state import get_ep_group
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.moe.comm_utils import (
     async_all_to_all, gather_from_sequence_parallel_region)
-from vllm_ascend.utils import AscendSocVersion, get_ascend_soc_version
+from vllm_ascend.utils import (AscendSocVersion, get_ascend_soc_version,
+                               is_hierarchical_communication_enabled)
 
 
 class MoETokenDispatcher(ABC):
@@ -61,7 +61,6 @@ class MoETokenDispatcher(ABC):
                        hidden_states: torch.Tensor,
                        topk_weights: torch.Tensor,
                        topk_ids: torch.Tensor,
-                       row_idx: torch.Tensor,
                        expert_map: Optional[torch.Tensor] = None,
                        log2phy: Optional[torch.Tensor] = None,
                        global_redundant_expert_num: int = 0,
@@ -70,7 +69,8 @@ class MoETokenDispatcher(ABC):
                        dynamic_scale_for_share: Optional[Any] = None,
                        mc2_mask: Optional[torch.Tensor] = None,
                        apply_router_weight_on_input: bool = False,
-                       with_quant: bool = False):
+                       with_quant: bool = False,
+                       dynamic_eplb: bool = False):
         raise NotImplementedError("Dispatch function not implemented.")
 
     @abstractmethod
@@ -99,6 +99,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         # NOTE: Currently, when in A3, we need to pass in some extra param into dispatch & combine
         self.a3_need_extra_args = \
             get_ascend_soc_version() == AscendSocVersion.A3
+        # NOTE: When in A2, setting the environment variables HCCL_INTRA_PCIE_ENABLE=1 and
+        # HCCL_INTRA_ROCE_ENABLE=0 can reduce cross-machine communication traffic and significantly
+        # improve communication performance.
+        self.need_expert_scale = is_hierarchical_communication_enabled()
         self.output = None
         self.assist_info_for_combine = None
         self.ep_recv_counts = None
@@ -108,6 +112,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         self.shared_experts = None
         self.mc2_mask = None
         self.with_quant = False
+        self.expand_scales = None
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -117,21 +122,14 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         expert_map: torch.Tensor,
         global_redundant_expert_num: int = 0,
     ):
-        if self.with_quant:
-            quant_mode = 2
-            if (expert_map is not None):
-                moe_expert_num = len(expert_map) + global_redundant_expert_num
-            else:
-                moe_expert_num = global_redundant_expert_num
-        else:
-            quant_mode = 0
-            moe_expert_num = len(expert_map)
+        quant_mode = 2 if self.with_quant else 0
+        self.moe_expert_num = len(expert_map) + global_redundant_expert_num
         kwargs_mc2 = {
             "x": hidden_states,
             "expert_ids": topk_ids,
             "expert_shard_type": 0,
             "shared_expert_rank_num": 0,
-            "moe_expert_num": moe_expert_num,
+            "moe_expert_num": self.moe_expert_num,
             "global_bs": 0,
             "expert_token_nums_type": 0,
         }
@@ -153,6 +151,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             stage1_kwargs.update({
                 "x_active_mask": self.mc2_mask,
             })
+        if self.need_expert_scale:
+            stage1_kwargs.update({
+                "expert_scales":
+                topk_weights.to(torch.float32),
+            })
 
         kwargs_mc2.update(stage1_kwargs)
         return kwargs_mc2
@@ -161,7 +164,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                        hidden_states: torch.Tensor,
                        topk_weights: torch.Tensor,
                        topk_ids: torch.Tensor,
-                       row_idx: torch.Tensor,
                        expert_map: Optional[torch.Tensor] = None,
                        log2phy: Optional[torch.Tensor] = None,
                        global_redundant_expert_num: int = 0,
@@ -170,7 +172,12 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                        dynamic_scale_for_share: Optional[Any] = None,
                        mc2_mask: Optional[torch.Tensor] = None,
                        apply_router_weight_on_input: bool = False,
-                       with_quant: bool = False):
+                       with_quant: bool = False,
+                       dynamic_eplb: bool = False):
+        # Apply log2phy if needed
+        if log2phy is not None:
+            topk_ids = log2phy[topk_ids]
+
         self.with_quant = with_quant
         self.expert_map = expert_map
         self.topk_ids = topk_ids
@@ -186,8 +193,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         ) if self.enable_dispatch_v2 else torch_npu.npu_moe_distribute_dispatch(
             **kwargs_mc2)
         # comm_stream.wait_stream(torch.npu.current_stream())
-        expand_x, dynamic_scale, self.assist_info_for_combine, \
-            expert_token_nums, self.ep_recv_counts = self.output[0:5]
+        expand_x, dynamic_scale, self.assist_info_for_combine, expert_token_nums, \
+            self.ep_recv_counts, _, self.expand_scales = self.output[0:7]
 
         if self.with_quant:
             if shared_experts is not None:
@@ -218,7 +225,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         assert self.topk_weights is not None
         assert self.topk_ids is not None
         assert self.output is not None
-        moe_expert_num = len(self.expert_map)
         # moeCombine
         kwargs_mc2 = {
             "expand_x": hidden_states,
@@ -226,7 +232,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "expert_scales": self.topk_weights.to(torch.float32),
             "expert_shard_type": 0,
             "shared_expert_rank_num": 0,
-            "moe_expert_num": moe_expert_num,
+            "moe_expert_num": self.moe_expert_num,
             "global_bs": 0,
         }
         if self.with_quant:
@@ -240,6 +246,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "group_ep": self.moe_all_to_all_group_name,
             "ep_world_size": self.ep_world_size,
             "ep_rank_id": self.ep_rank_id,
+            "expand_scales": self.expand_scales,
         }
         if self.enable_dispatch_v2:
             stage3_kwargs.update({
@@ -281,6 +288,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         self.topk_weights = None
         self.mc2_mask = None
         self.expert_map = None
+        self.expand_scales = None
 
         if self.shared_experts is None:
             return hidden_states
@@ -318,7 +326,6 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
                        hidden_states: torch.Tensor,
                        topk_weights: torch.Tensor,
                        topk_ids: torch.Tensor,
-                       row_idx: torch.Tensor,
                        expert_map: Optional[torch.Tensor] = None,
                        log2phy: Optional[torch.Tensor] = None,
                        global_redundant_expert_num: int = 0,
@@ -327,7 +334,8 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
                        dynamic_scale_for_share: Optional[Any] = None,
                        mc2_mask: Optional[torch.Tensor] = None,
                        apply_router_weight_on_input: bool = False,
-                       with_quant: bool = False):
+                       with_quant: bool = False,
+                       dynamic_eplb: bool = False):
         self.with_quant = with_quant
         self.original_shape = hidden_states.shape
 
@@ -346,7 +354,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
             hidden_states = hidden_states * \
                 topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
-            global_num_experts = len(expert_map)
+            global_num_experts = len(expert_map) + global_redundant_expert_num
             mask = (expert_map[topk_ids] != -1)
             self.topk_weights = topk_weights * mask
             first_expert_idx = get_ep_group(
@@ -383,7 +391,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
         assert self.original_shape is not None
         final_hidden_states = torch_npu.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,
-            sorted_indices=self.expanded_row_idx,
+            sorted_indices=torch.abs(self.expanded_row_idx),
             probs=self.topk_weights)
         if len(self.original_shape) == 3:
             final_hidden_states = final_hidden_states.view(self.original_shape)
@@ -410,7 +418,6 @@ class TokenDispatcherWithMoge(MoETokenDispatcher):
                        hidden_states: torch.Tensor,
                        topk_weights: torch.Tensor,
                        topk_ids: torch.Tensor,
-                       row_idx: torch.Tensor,
                        expert_map: Optional[torch.Tensor] = None,
                        log2phy: Optional[torch.Tensor] = None,
                        global_redundant_expert_num: int = 0,
@@ -419,7 +426,8 @@ class TokenDispatcherWithMoge(MoETokenDispatcher):
                        dynamic_scale_for_share: Optional[Any] = None,
                        mc2_mask: Optional[torch.Tensor] = None,
                        apply_router_weight_on_input: bool = False,
-                       with_quant: bool = False):
+                       with_quant: bool = False,
+                       dynamic_eplb: bool = False):
         self.bsz, _ = hidden_states.shape
         flatten_topk_ids = topk_ids.view(-1)
         self.sorted_topk_ids = torch.argsort(flatten_topk_ids.float())
@@ -468,9 +476,6 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         super().__init__(**kwargs)
         self.with_quant = False
         self.num_local_experts = kwargs.get("num_local_experts", 0)
-        self.num_global_redundant_experts = kwargs.get(
-            "num_global_redundant_experts", 0)
-        self.num_experts = self.num_experts + self.num_global_redundant_experts
 
         self.hidden_shape = None
         self.topk_weights = None
@@ -511,7 +516,6 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                        hidden_states: torch.Tensor,
                        topk_weights: torch.Tensor,
                        topk_ids: torch.Tensor,
-                       row_idx: torch.Tensor,
                        expert_map: Optional[torch.Tensor] = None,
                        log2phy: Optional[torch.Tensor] = None,
                        global_redundant_expert_num: int = 0,
@@ -520,7 +524,8 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                        dynamic_scale_for_share: Optional[Any] = None,
                        mc2_mask: Optional[torch.Tensor] = None,
                        apply_router_weight_on_input: bool = False,
-                       with_quant: bool = False):
+                       with_quant: bool = False,
+                       dynamic_eplb: bool = False):
         self.with_quant = with_quant
         self.hidden_shape = hidden_states.shape
         self.topk_weights = topk_weights
