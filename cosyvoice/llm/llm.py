@@ -397,7 +397,9 @@ class Qwen2LM(TransformerLM):
         embeds = embeds.detach().to(torch.bfloat16).contiguous().cpu()
         # Only ``prompt_embeds`` (EmbedsPrompt). Extra keys break vLLM input
         # preprocessing and can yield neither token ids nor embeds on the worker.
-        prompt: dict = {"prompt_embeds": embeds}
+        import pdb;pdb.set_trace()
+        prompt: dict = {"prompt_embeds": embeds, "prompt_token_ids":[0,0]}
+        
         with self.lock:
             self.vllm.add_request(req_id, prompt, sampling_params)
             self.vllm_output_queue[req_id] = queue.Queue()
@@ -407,7 +409,7 @@ class Qwen2LM(TransformerLM):
                 with self.lock:
                     if self.vllm_output_queue[req_id].empty():
                         # import pdb;pdb.set_trace()
-                        request_outputs: List[RequestOutput] = self.vllm.step()
+                        request_outputs: List[RequestOutput] = self.vllm.step()#拉出最后一个tokenid
                         for request_output in request_outputs:
                             top_ids = list(request_output.outputs[0].token_ids)[-1]
                             self.vllm_output_queue[request_output.request_id].put(top_ids)
