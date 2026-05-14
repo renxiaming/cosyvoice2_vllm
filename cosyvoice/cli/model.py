@@ -439,7 +439,10 @@ class CosyVoice2Model(CosyVoiceModel):
         self.flow.encoder = flow_encoder
 
     def load_vllm(self, model_dir):
-        from cosyvoice.utils.vllm_runtime import ensure_vllm_package_has_version
+        from cosyvoice.utils.vllm_runtime import (
+            assert_vllm_ipc_supports_prompt_embeds,
+            ensure_vllm_package_has_version,
+        )
 
         export_cosyvoice2_vllm(self.llm, model_dir, self.device)
         EngineArgs, LLMEngine = _import_vllm_engine_classes()
@@ -447,6 +450,11 @@ class CosyVoice2Model(CosyVoiceModel):
         # vLLM / vllm-ascend layouts differ: only pass device= when EngineArgs accepts it.
         _max_ml = int(os.environ.get("COSYVOICE_VLLM_MAX_MODEL_LEN", "16384"))
         _gpu_util = float(os.environ.get("COSYVOICE_VLLM_GPU_MEMORY_UTILIZATION", "0.3"))
+        # Chunked prefill + prompt_embeds has seen bad NewRequestData on some Ascend
+        # stacks; default off (set COSYVOICE_VLLM_CHUNKED_PREFILL=1 to re-enable).
+        _chunk_prefill = os.environ.get(
+            "COSYVOICE_VLLM_CHUNKED_PREFILL", "0"
+        ).lower() in ("1", "true", "yes")
         base_kwargs = dict(
             model=model_dir,
             skip_tokenizer_init=True,
@@ -461,11 +469,16 @@ class CosyVoice2Model(CosyVoiceModel):
         _params = (
             inspect.signature(_ea_init).parameters if _ea_init is not None else {}
         )
+        if "enable_chunked_prefill" in _params:
+            base_kwargs["enable_chunked_prefill"] = _chunk_prefill
+        elif "chunked_prefill_enabled" in _params:
+            base_kwargs["chunked_prefill_enabled"] = _chunk_prefill
         if "device" in _params:
             engine_args = EngineArgs(**base_kwargs, device="npu")
         else:
             engine_args = EngineArgs(**base_kwargs)
         ensure_vllm_package_has_version()
+        assert_vllm_ipc_supports_prompt_embeds()
         self.llm.vllm = LLMEngine.from_engine_args(engine_args)
         self.llm.lock = threading.Lock()
         del self.llm.llm.model.model.layers

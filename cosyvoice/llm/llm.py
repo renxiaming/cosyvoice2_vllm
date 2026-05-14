@@ -384,11 +384,22 @@ class Qwen2LM(TransformerLM):
             max_tokens=max_tokens,
         )
         req_id = str(uuid.uuid4())
-        embeds = lm_input.squeeze(0).to(torch.bfloat16).to(lm_input.device)
-        prompt: dict = {"prompt_embeds": embeds, "prompt_token":lm_input}
-        import pdb;pdb.set_trace
+        # Prefetch path uses NPU tensors; vLLM V1 serializes ``prompt_embeds`` to
+        # EngineCore via msgpack byte views on *CPU* tensors. Keeping tensors on
+        # NPU can decode as missing/None on the worker, causing
+        # "Neither prompt_token_ids nor prompt_embeds were defined".
+        if lm_input.dim() == 3:
+            embeds = lm_input.squeeze(0)
+        else:
+            embeds = lm_input
+        if getattr(torch, "npu", None) is not None and embeds.device.type == "npu":
+            torch.npu.synchronize()
+        embeds = embeds.detach().to(torch.bfloat16).contiguous().cpu()
+        # Only ``prompt_embeds`` (EmbedsPrompt). Extra keys break vLLM input
+        # preprocessing and can yield neither token ids nor embeds on the worker.
+        prompt: dict = {"prompt_embeds": embeds}
         with self.lock:
-            self.vllm.add_request(req_id, prompt, sampling_params)#报错发生处
+            self.vllm.add_request(req_id, prompt, sampling_params)
             self.vllm_output_queue[req_id] = queue.Queue()
         out_tokens = []
         try:
